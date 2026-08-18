@@ -1,0 +1,22 @@
+# Post-stack seismic inversion app.
+# Pinned to the versions the app was developed and tested against.
+# Python >= 3.10 (the code uses PEP 604 `X | None` annotations).
+
+streamlit==1.61.1
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.0.5
+plotly==6.9.0
+
+# SEG-Y I/O. segysak resolves 3D geometry into xarray and is the primary path;
+# segyio is both its backend and our raw-trace fallback for awkward headers.
+segysak==0.5.4
+segyio==1.9.14
+
+# LAS well logs
+lasio==0.32
+
+# Pulled in by segysak, pinned so the xarray/NetCDF export path is reproducible.
+xarray==2026.7.0
+dask==2026.7.1
+h5netcdf==1.8.1

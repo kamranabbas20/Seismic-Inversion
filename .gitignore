@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Generated demo data and app outputs
+demo_data/
+*.sgy
+*.segy
+*.nc
+*.npy
+
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
+.streamlit/secrets.toml
