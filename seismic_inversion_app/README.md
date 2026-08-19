@@ -70,12 +70,18 @@ background model fails.
 | Step | What it does |
 | --- | --- |
 | **1 - Data** | Three sources: a synthetic dataset, a **well folder** scanned in one go (F3 demo layout), or file-by-file upload. SEG-Y with byte positions and a header scan, multi-well LAS, time-depth / deviation / marker files, optional well-header and horizon CSVs. |
-| **2 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks, checkshot / deviation / marker review. |
-| **3 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
-| **4 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
-| **5 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
-| **6 - Inversion** | Method selection, method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
-| **7 - Results & export** | Section viewer, time slice, per-trace QC maps, crossplot against well logs, export. |
+| **2 - Seismic viewer** | Inline, crossline, time slice and an arbitrary traverse through chosen wells, with gain, clip and colour-scale controls and well overlays. |
+| **3 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks, checkshot / deviation / marker review. |
+| **4 - Well correlation** | Wells side by side in a chosen order with logs, tops and the seismic trace at each, correlation lines between tops, and flattening on a datum. |
+| **5 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
+| **6 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
+| **7 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
+| **8 - Inversion** | Method selection, method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
+| **9 - Results & export** | Section viewer, time slice, per-trace QC maps, crossplot against well logs, export. |
+
+Step numbers are derived from one list in `app.py`, and every "see step N" in the
+help text is generated from it, so inserting a page cannot leave stale numbering
+behind.
 
 Everything is held in `st.session_state`, so moving between steps never reloads
 data. Changing something upstream (a bulk shift, the wells, the volume) clears
@@ -258,6 +264,55 @@ only has to be a good default.
 
 A well missing a density curve still loads, and shows up as a failed check to
 resolve here, rather than being rejected at the door and lost.
+
+---
+
+## Viewing the seismic
+
+**Step 2** browses the input volume before any inversion touches it:
+
+- **Inline / crossline** sections with a line selector, and wells projected onto
+  the section only when they are within a chosen number of bins — projecting a
+  well from far away would misrepresent where it is, so the distance is yours
+  to set.
+- **Time slice** in map view with the wells marked.
+- **Traverse through wells** — an arbitrary line following a polyline through
+  the wells you pick, in the order you pick them. Traces are taken at the
+  nearest bin rather than interpolated, so the section shows real traces the
+  survey recorded, and the horizontal axis is true distance in metres rather
+  than trace number.
+
+Gain, clip percentile and colour scale are display-only; none of them touch the
+data. A per-line amplitude summary (RMS, p99, dead-trace count) sits under the
+section.
+
+---
+
+## Well correlation
+
+**Step 4** is a conventional correlation panel: the wells you select, left to
+right in the order you select them, each showing its log, its formation tops
+and the seismic trace extracted at its location.
+
+- **Order** follows your selection order — clear and re-pick to rearrange.
+- **Log curve** is chosen from the curves present in *every* selected well
+  (plus the derived AI, Vp and Rho), and is scaled on a range shared across all
+  of them, so a thickening or a sharpening really is comparable between wells.
+- **Seismic** is drawn as a wiggle with the positive lobes filled — the
+  convention that lets the eye follow peaks across the panel — from the same
+  IDW-blended trace the well tie uses.
+- **Tops** are drawn per well and joined between adjacent wells by correlation
+  lines. Only tops present in at least two selected wells are offered, since a
+  pick in a single well cannot be correlated.
+- **Flatten on** hangs the panel on a chosen top instead of two-way time; wells
+  missing that top are named rather than silently left unflattened.
+
+The panel is drawn on a single axes with one slot per well rather than as a
+subplot grid, because the correlation lines have to run *between* wells — in a
+grid that means paper-coordinate shapes that drift out of alignment whenever
+the layout changes. The same traverse used by the seismic viewer is available
+in an expander underneath, so the wells and the section between them can be
+read together.
 
 ---
 

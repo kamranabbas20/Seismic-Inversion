@@ -17,6 +17,8 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
+from scipy.spatial import cKDTree
+
 from . import utils
 
 # Streamlit is optional at import time so the numeric core can be used from a
@@ -1769,6 +1771,94 @@ def extract_well_traces(
             )
         )
     return ties
+
+
+# ==========================================================================
+# Arbitrary line extraction
+# ==========================================================================
+
+@dataclass
+class ArbitraryLine:
+    """A seismic section sampled along a polyline through the survey."""
+
+    data: np.ndarray                     # (n_points, n_samples)
+    distance: np.ndarray                 # cumulative metres along the path
+    x: np.ndarray
+    y: np.ndarray
+    iline: np.ndarray
+    xline: np.ndarray
+    twt: np.ndarray
+    node_distance: np.ndarray = field(default_factory=lambda: np.array([]))
+    node_label: list = field(default_factory=list)
+
+    def summary(self) -> dict:
+        return {
+            "points": int(self.data.shape[0]),
+            "length (m)": f"{self.distance[-1]:.0f}" if self.distance.size else "0",
+            "nodes": len(self.node_label),
+        }
+
+
+def extract_arbitrary_line(
+    volume,
+    points: Sequence[Sequence[float]],
+    labels: Sequence[str] | None = None,
+    step_m: float | None = None,
+) -> ArbitraryLine:
+    """Sample the cube along a polyline joining map coordinates.
+
+    Traces are taken by nearest bin rather than interpolated: a seismic section
+    should show real traces, and interpolating between them would invent
+    amplitudes that the survey never recorded.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        raise ValueError("an arbitrary line needs at least two points")
+
+    xy = volume.trace_xy()
+    n_il, n_xl = volume.data.shape[:2]
+
+    # Default sampling: roughly one point per bin along the path.
+    if step_m is None:
+        spacing = np.median(np.abs(np.diff(volume.cdp_x[:, 0]))) if n_il > 1 else 0.0
+        alt = np.median(np.abs(np.diff(volume.cdp_y[0, :]))) if n_xl > 1 else 0.0
+        step_m = float(max(min([v for v in (spacing, alt) if v > 0], default=25.0), 1.0))
+
+    seg_lengths = np.hypot(*(pts[1:] - pts[:-1]).T)
+    total = float(seg_lengths.sum())
+    if total <= 0:
+        raise ValueError("the polyline has zero length -- are all the wells at the same location?")
+    n_points = int(np.clip(round(total / step_m) + 1, 2, 5000))
+
+    node_distance = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    want = np.linspace(0.0, total, n_points)
+    path_x = np.interp(want, node_distance, pts[:, 0])
+    path_y = np.interp(want, node_distance, pts[:, 1])
+
+    tree = cKDTree(xy)
+    _, flat_idx = tree.query(np.column_stack([path_x, path_y]))
+    il_idx, xl_idx = np.divmod(flat_idx, n_xl)
+
+    return ArbitraryLine(
+        data=volume.flat_data()[flat_idx, :],
+        distance=want,
+        x=path_x, y=path_y,
+        iline=volume.iline[il_idx],
+        xline=volume.xline[xl_idx],
+        twt=volume.twt,
+        node_distance=node_distance,
+        node_label=list(labels) if labels is not None else [],
+    )
+
+
+def line_through_wells(volume, wells: Sequence, order: Sequence[str] | None = None) -> ArbitraryLine:
+    """Arbitrary line joining the given wells, in the order supplied."""
+    located = {w.name: w for w in wells if getattr(w, "has_location", False)}
+    names = [n for n in (order or list(located)) if n in located]
+    if len(names) < 2:
+        raise ValueError("at least two located wells are needed for a traverse")
+    pts = [(located[n].x, located[n].y) for n in names]
+    return extract_arbitrary_line(volume, pts, labels=names)
 
 
 # ==========================================================================

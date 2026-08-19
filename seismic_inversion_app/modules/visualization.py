@@ -44,6 +44,7 @@ def section_figure(
     colorbar_title: str = "amplitude",
     wells: Sequence[dict] | None = None,
     height: int = 520,
+    gain: float = 1.0,
 ) -> go.Figure:
     """A single seismic / attribute section with an optional well overlay.
 
@@ -55,7 +56,7 @@ def section_figure(
 
     finite = img[np.isfinite(img)]
     if symmetric:
-        lim = utils.safe_percentile_clip(img, clip_percentile)
+        lim = utils.safe_percentile_clip(img, clip_percentile) / max(gain, 1e-6)
         zmin, zmax = -lim, lim
     elif finite.size:
         zmin = float(np.percentile(finite, 100 - clip_percentile))
@@ -213,6 +214,283 @@ def time_slice_figure(
     )
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
+
+
+def arbitrary_line_figure(
+    line,
+    title: str = "",
+    colorscale: str = SEISMIC_SCALE,
+    clip_percentile: float = 99.0,
+    gain: float = 1.0,
+    height: int = 540,
+    show_nodes: bool = True,
+) -> go.Figure:
+    """A section sampled along a polyline, with the well nodes marked.
+
+    The horizontal axis is true distance along the path, not trace number, so
+    an unevenly-spaced traverse is not silently stretched.
+    """
+    img = np.asarray(line.data, dtype=float).T
+    lim = utils.safe_percentile_clip(img, clip_percentile) / max(gain, 1e-6)
+
+    fig = go.Figure(go.Heatmap(
+        z=img, x=line.distance, y=line.twt, colorscale=colorscale,
+        zmin=-lim, zmax=lim, colorbar=dict(title="amp", thickness=14),
+        hovertemplate="distance: %{x:.0f} m<br>twt: %{y:.0f} ms<br>amp: %{z:.4g}<extra></extra>"))
+
+    if show_nodes and len(line.node_label):
+        t0, t1 = float(np.min(line.twt)), float(np.max(line.twt))
+        for distance, label in zip(line.node_distance, line.node_label):
+            fig.add_trace(go.Scatter(
+                x=[distance, distance], y=[t0, t1], mode="lines",
+                line=dict(color="black", width=2), showlegend=False,
+                hoverinfo="text", hovertext=label))
+            fig.add_annotation(x=distance, y=t0, text=label, showarrow=False,
+                               yshift=10, font=dict(size=11))
+
+    fig.update_layout(
+        title=title or "Arbitrary line", template=_TEMPLATE, height=height,
+        xaxis_title="distance along traverse (m)", yaxis_title="TWT (ms)",
+        margin=dict(l=60, r=20, t=55, b=45))
+    fig.update_yaxes(autorange="reversed")
+    return fig
+
+
+# --------------------------------------------------------------------------
+# Well correlation panel
+# --------------------------------------------------------------------------
+
+_MARKER_PALETTE = ["#c0504d", "#4f81bd", "#9bbb59", "#8064a2", "#4bacc6", "#f79646",
+                   "#7f6084", "#2c7873", "#b06f3a", "#5b6b8c"]
+
+
+def _wiggle_polygon(amp: np.ndarray, twt: np.ndarray, centre: float, half_width: float):
+    """Positive-lobe fill polygon for a wiggle trace, plus the wiggle line.
+
+    Returns ``(fill_x, fill_y, line_x)``.  Only the positive lobes are filled,
+    which is the convention that makes a correlation panel readable: the eye
+    follows the black peaks across the wells.
+    """
+    amp = np.nan_to_num(np.asarray(amp, dtype=float))
+    line_x = centre + amp * half_width
+    fill_x = centre + np.clip(amp, 0.0, None) * half_width
+    poly_x = np.concatenate([fill_x, np.full(fill_x.size, centre)[::-1]])
+    poly_y = np.concatenate([twt, twt[::-1]])
+    return poly_x, poly_y, line_x
+
+
+def correlation_figure(
+    wells,
+    order,
+    ties=None,
+    curve: str = "AI",
+    show_logs: bool = True,
+    show_seismic: bool = True,
+    flatten_marker: str | None = None,
+    t_min: float | None = None,
+    t_max: float | None = None,
+    gain: float = 1.0,
+    marker_names=None,
+    connect_markers: bool = True,
+    height: int = 800,
+) -> go.Figure:
+    """A classic well-correlation panel: wells side by side in a chosen order.
+
+    Drawn on a single axes with one slot per well rather than as subplots,
+    because the correlation lines have to run *between* wells -- in a subplot
+    grid that means paper-coordinate shapes that drift out of alignment as soon
+    as the layout changes.
+
+    Logs are scaled on a shared range across every displayed well, so a
+    thickening or a sharpening really is comparable from one well to the next.
+    ``flatten_marker`` hangs the panel on a chosen top; without it the datum is
+    two-way time.
+    """
+    ties = {t.well: t for t in (ties or [])}
+    by_name = {w.name: w for w in wells}
+    names = [n for n in order if n in by_name]
+    if not names:
+        raise ValueError("no wells selected for correlation")
+
+    # ---- vertical shifts -------------------------------------------------
+    shifts: dict[str, float] = {n: 0.0 for n in names}
+    missing_datum: list[str] = []
+    if flatten_marker:
+        picks = {}
+        for n in names:
+            hit = next((m for m in by_name[n].markers
+                        if m.name == flatten_marker and m.twt is not None), None)
+            if hit is None:
+                missing_datum.append(n)
+            else:
+                picks[n] = float(hit.twt)
+        if picks:
+            reference = float(np.mean(list(picks.values())))
+            shifts = {n: (reference - picks[n]) if n in picks else 0.0 for n in names}
+
+    # ---- shared scaling --------------------------------------------------
+    log_values, seis_values = [], []
+    for n in names:
+        well = by_name[n]
+        if show_logs:
+            values = _curve_values(well, curve)
+            if values is not None:
+                log_values.append(values[np.isfinite(values)])
+        if show_seismic and n in ties:
+            seis_values.append(np.nan_to_num(ties[n].seismic))
+    log_lo, log_hi = _shared_range(log_values)
+    seis_scale = (np.percentile(np.abs(np.concatenate(seis_values)), 99)
+                  if seis_values else 1.0) or 1.0
+
+    both = show_logs and show_seismic and log_values and seis_values
+    fig = go.Figure()
+    marker_colour: dict[str, str] = {}
+    marker_positions: dict[str, list[tuple[float, float, float]]] = {}
+
+    for i, n in enumerate(names):
+        well = by_name[n]
+        shift = shifts[n]
+        if both:
+            log_span, seis_span = (i + 0.06, i + 0.44), (i + 0.52, i + 0.94)
+        else:
+            log_span = seis_span = (i + 0.10, i + 0.90)
+
+        if show_logs:
+            values = _curve_values(well, curve)
+            if values is not None:
+                twt = np.asarray(well.twt, dtype=float) + shift
+                good = np.isfinite(values) & np.isfinite(twt)
+                if good.any():
+                    lo, hi = log_span
+                    scaled = lo + (np.clip(values[good], log_lo, log_hi) - log_lo) / max(log_hi - log_lo, 1e-9) * (hi - lo)
+                    fig.add_trace(go.Scatter(
+                        x=scaled, y=twt[good], mode="lines", name=curve,
+                        line=dict(color="#8064a2", width=1),
+                        legendgroup=curve, showlegend=(i == 0),
+                        hovertemplate=f"{n}<br>{curve}: %{{customdata:.4g}}<br>twt: %{{y:.0f}} ms<extra></extra>",
+                        customdata=values[good]))
+
+        if show_seismic and n in ties:
+            tie = ties[n]
+            twt = np.asarray(tie.twt, dtype=float) + shift
+            amp = np.nan_to_num(np.asarray(tie.seismic, dtype=float)) / seis_scale * gain
+            amp = np.clip(amp, -1.2, 1.2)
+            centre = 0.5 * (seis_span[0] + seis_span[1])
+            half = 0.5 * (seis_span[1] - seis_span[0])
+            poly_x, poly_y, line_x = _wiggle_polygon(amp, twt, centre, half)
+            fig.add_trace(go.Scatter(
+                x=poly_x, y=poly_y, fill="toself", mode="none",
+                fillcolor="rgba(20,20,20,0.85)", hoverinfo="skip",
+                legendgroup="seismic", showlegend=False))
+            fig.add_trace(go.Scatter(
+                x=line_x, y=twt, mode="lines", line=dict(color="black", width=0.8),
+                name="seismic", legendgroup="seismic", showlegend=(i == 0),
+                hovertemplate=f"{n}<br>amp: %{{customdata:.4g}}<br>twt: %{{y:.0f}} ms<extra></extra>",
+                customdata=np.nan_to_num(tie.seismic)))
+
+        # ---- markers -----------------------------------------------------
+        for marker in well.markers:
+            if marker.twt is None or not np.isfinite(marker.twt):
+                continue
+            if marker_names is not None and marker.name not in marker_names:
+                continue
+            y = float(marker.twt) + shift
+            colour = marker_colour.setdefault(
+                marker.name, _MARKER_PALETTE[len(marker_colour) % len(_MARKER_PALETTE)])
+            fig.add_trace(go.Scatter(
+                x=[i + 0.04, i + 0.96], y=[y, y], mode="lines",
+                line=dict(color=colour, width=2), name=marker.name,
+                legendgroup=marker.name, showlegend=marker.name not in marker_positions,
+                hovertemplate=f"{n}<br>{marker.name}<br>MD {marker.md:.1f} m<br>"
+                              f"TWT %{{y:.0f}} ms<extra></extra>"))
+            marker_positions.setdefault(marker.name, []).append((i, y, colour))
+
+    # ---- correlation lines between adjacent wells ------------------------
+    if connect_markers:
+        for name, hits in marker_positions.items():
+            hits.sort()
+            for (i0, y0, colour), (i1, y1, _) in zip(hits, hits[1:]):
+                fig.add_trace(go.Scatter(
+                    x=[i0 + 0.96, i1 + 0.04], y=[y0, y1], mode="lines",
+                    line=dict(color=colour, width=1.2, dash="dot"),
+                    legendgroup=name, showlegend=False, hoverinfo="skip"))
+
+    for i in range(1, len(names)):
+        fig.add_vline(x=i, line=dict(color="#d9d9d9", width=1))
+
+    subtitle = f"flattened on {flatten_marker}" if flatten_marker else "hung on TWT"
+    if missing_datum:
+        subtitle += f" (no {flatten_marker} in: {', '.join(missing_datum)})"
+
+    fig.update_layout(
+        title=f"Well correlation - {len(names)} wells, {subtitle}",
+        template=_TEMPLATE, height=height,
+        xaxis=dict(tickmode="array", tickvals=[i + 0.5 for i in range(len(names))],
+                   ticktext=names, range=[0, len(names)], showgrid=False),
+        yaxis_title="TWT (ms)",
+        legend=dict(orientation="h", y=-0.08),
+        margin=dict(l=65, r=20, t=60, b=70))
+    fig.update_yaxes(autorange="reversed")
+    if t_min is not None and t_max is not None:
+        fig.update_yaxes(range=[t_max, t_min])
+    return fig
+
+
+def _curve_values(well, curve: str):
+    """Resolve a display curve by name, including the derived AI/Vp/Rho."""
+    key = str(curve).upper()
+    if key == "AI":
+        return well.ai
+    if key in ("VP", "VELOCITY"):
+        return well.vp
+    if key in ("RHO", "RHOB", "DENSITY"):
+        return well.rho
+    for mnemonic, values in well.curves.items():
+        if mnemonic.upper() == key:
+            return np.asarray(values, dtype=float)
+    return None
+
+
+def _shared_range(arrays, low: float = 2.0, high: float = 98.0):
+    """Percentile range across every well, so the logs are comparable."""
+    pooled = [a for a in arrays if a is not None and np.size(a)]
+    if not pooled:
+        return 0.0, 1.0
+    flat = np.concatenate(pooled)
+    flat = flat[np.isfinite(flat)]
+    if flat.size == 0:
+        return 0.0, 1.0
+    lo, hi = float(np.percentile(flat, low)), float(np.percentile(flat, high))
+    return (lo, hi) if hi > lo else (lo, lo + 1.0)
+
+
+def common_curves(wells, order=None) -> list[str]:
+    """Curves available in every selected well, plus the derived ones."""
+    names = [w.name for w in wells] if order is None else list(order)
+    chosen = [w for w in wells if w.name in names]
+    if not chosen:
+        return ["AI", "Vp", "Rho"]
+    shared = set(chosen[0].curves)
+    for well in chosen[1:]:
+        shared &= set(well.curves)
+    return ["AI", "Vp", "Rho"] + sorted(m for m in shared if m.upper() != "DEPT")
+
+
+def common_markers(wells, order=None) -> list[str]:
+    """Marker names present in at least two of the selected wells.
+
+    A top that appears in only one well cannot be correlated, so offering it as
+    a flattening datum would be misleading.
+    """
+    names = [w.name for w in wells] if order is None else list(order)
+    counts: dict[str, int] = {}
+    for well in wells:
+        if well.name not in names:
+            continue
+        for marker in well.markers:
+            if marker.twt is not None:
+                counts[marker.name] = counts.get(marker.name, 0) + 1
+    return sorted(name for name, count in counts.items() if count >= 2)
 
 
 # --------------------------------------------------------------------------

@@ -858,6 +858,141 @@ def test_find_segy_files_orders_by_size():
     assert found[0] == big and small in found, found
 
 
+# --------------------------------------------------------------------------
+# Seismic viewer and well correlation
+# --------------------------------------------------------------------------
+
+def _correlation_case(n_wells: int = 3):
+    """A cube plus wells carrying markers, positioned inside the survey."""
+    vol, wells = data_io.make_synthetic_dataset(n_iline=24, n_xline=24, n_samples=400,
+                                                n_wells=n_wells, seed=9)
+    for k, well in enumerate(wells):
+        well.attach_markers([
+            data_io.Marker(md=400.0 + 60 * k, name="TOP_A"),
+            data_io.Marker(md=800.0 + 60 * k, name="TOP_B"),
+            data_io.Marker(md=1200.0 + 60 * k, name=f"LOCAL_{k}"),
+        ])
+    ties = data_io.extract_well_traces(vol, wells)
+    return vol, wells, ties
+
+
+def test_arbitrary_line_follows_the_well_path():
+    vol, wells, _ = _correlation_case(4)
+    order = [w.name for w in wells]
+    line = data_io.line_through_wells(vol, wells, order)
+
+    assert line.data.shape[1] == vol.shape[2]
+    assert line.node_label == order
+    assert np.all(np.diff(line.distance) > 0), "distance must increase along the path"
+    assert line.distance[-1] > 0
+
+    # Each node must land on the bin the well itself ties to.
+    ties = {t.well: t for t in data_io.extract_well_traces(vol, wells)}
+    for k, name in enumerate(order):
+        i = int(np.argmin(np.abs(line.distance - line.node_distance[k])))
+        assert int(line.iline[i]) == int(vol.iline[ties[name].il_index])
+        assert int(line.xline[i]) == int(vol.xline[ties[name].xl_index])
+
+
+def test_arbitrary_line_needs_two_distinct_points():
+    vol, wells, _ = _correlation_case(2)
+    for well in wells:
+        well.x, well.y = 500_000.0, 6_000_000.0      # all at one spot
+    try:
+        data_io.line_through_wells(vol, wells, [w.name for w in wells])
+    except ValueError as exc:
+        assert "zero length" in str(exc) or "two located" in str(exc)
+    else:
+        raise AssertionError("a degenerate traverse should be rejected")
+
+
+def test_correlation_panel_respects_the_requested_order():
+    vol, wells, ties = _correlation_case(3)
+    order = [w.name for w in wells][::-1]
+    fig = viz.correlation_figure(wells, order, ties)
+    assert list(fig.layout.xaxis.ticktext) == order, "wells must appear in the chosen order"
+    assert len(fig.data) > 0
+
+
+def test_correlation_flattening_aligns_the_datum():
+    """Flattening must put the chosen top at one time in every well."""
+    vol, wells, ties = _correlation_case(3)
+    raw = [next(m.twt for m in w.markers if m.name == "TOP_A") for w in wells]
+    assert max(raw) - min(raw) > 1.0, "the fixture should have a dipping datum"
+
+    order = [w.name for w in wells]
+    flat = viz.correlation_figure(wells, order, ties, flatten_marker="TOP_A",
+                                  connect_markers=False)
+    # The TOP_A traces are the horizontal ticks drawn in each well's slot.
+    tops = [t.y[0] for t in flat.data if t.name == "TOP_A"]
+    assert len(tops) == len(order)
+    assert max(tops) - min(tops) < 1e-6, f"TOP_A should be flat, spread {max(tops) - min(tops)}"
+
+
+def test_correlation_only_offers_correlatable_markers():
+    vol, wells, ties = _correlation_case(3)
+    order = [w.name for w in wells]
+    shared = viz.common_markers(wells, order)
+    assert "TOP_A" in shared and "TOP_B" in shared
+    assert not any(n.startswith("LOCAL_") for n in shared), \
+        "a marker in one well only cannot be correlated"
+
+
+def test_correlation_curves_are_those_common_to_every_well():
+    vol, wells, ties = _correlation_case(3)
+    wells[0].curves["EXTRA"] = np.zeros_like(wells[0].md)
+    order = [w.name for w in wells]
+    curves = viz.common_curves(wells, order)
+    assert curves[:3] == ["AI", "Vp", "Rho"]
+    assert "DT" in curves and "RHOB" in curves
+    assert "EXTRA" not in curves, "a curve in one well only is not comparable"
+    assert "DEPT" not in curves
+
+
+def test_correlation_variants_all_build():
+    vol, wells, ties = _correlation_case(3)
+    order = [w.name for w in wells]
+    variants = [
+        dict(),
+        dict(show_seismic=False),
+        dict(show_logs=False),
+        dict(curve="GR") if "GR" in viz.common_curves(wells, order) else dict(curve="Vp"),
+        dict(flatten_marker="TOP_B"),
+        dict(marker_names=["TOP_A"]),
+        dict(t_min=200.0, t_max=600.0),
+        dict(gain=3.0),
+    ]
+    for kwargs in variants:
+        assert len(viz.correlation_figure(wells, order, ties, **kwargs).data) > 0, kwargs
+    # and with no ties at all
+    assert len(viz.correlation_figure(wells, order, None).data) > 0
+
+
+def test_correlation_rejects_an_empty_selection():
+    vol, wells, ties = _correlation_case(2)
+    try:
+        viz.correlation_figure(wells, [], ties)
+    except ValueError as exc:
+        assert "no wells" in str(exc).lower()
+    else:
+        raise AssertionError("an empty well selection should be rejected")
+
+
+def test_section_gain_widens_the_colour_range():
+    vol, _, _ = _correlation_case(2)
+    plain = viz.section_figure(vol.data, vol.twt, vol.xline, "inline", 3, gain=1.0)
+    loud = viz.section_figure(vol.data, vol.twt, vol.xline, "inline", 3, gain=4.0)
+    assert loud.data[0].zmax < plain.data[0].zmax, "more gain means a tighter colour range"
+
+
+def test_arbitrary_line_figure_builds():
+    vol, wells, _ = _correlation_case(3)
+    line = data_io.line_through_wells(vol, wells, [w.name for w in wells])
+    fig = viz.arbitrary_line_figure(line)
+    assert len(fig.data) > 0
+    assert [a.text for a in fig.layout.annotations] == [w.name for w in wells]
+
+
 def test_bulk_shift_is_not_cumulative():
     _, wells = data_io.make_synthetic_dataset(n_iline=5, n_xline=5, n_samples=80, n_wells=1)
     well = wells[0]

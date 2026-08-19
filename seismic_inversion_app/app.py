@@ -26,15 +26,33 @@ from modules import data_io, inversion, low_freq_model, utils, visualization as 
 
 st.set_page_config(page_title="Post-Stack Seismic Inversion", page_icon="~", layout="wide")
 
-STEPS = [
-    "1 - Data",
-    "2 - Log QC",
-    "3 - Well tie QC",
-    "4 - Wavelet",
-    "5 - Low-frequency model",
-    "6 - Inversion",
-    "7 - Results & export",
+# Workflow pages, in order.  Step numbers and every "see step N" cross-reference
+# are derived from this list, so inserting a page cannot leave stale numbering
+# scattered through the help text.
+PAGES = [
+    ("data", "Data"),
+    ("seismic", "Seismic viewer"),
+    ("logqc", "Log QC"),
+    ("correlation", "Well correlation"),
+    ("tie", "Well tie QC"),
+    ("wavelet", "Wavelet"),
+    ("lfm", "Low-frequency model"),
+    ("inversion", "Inversion"),
+    ("results", "Results & export"),
 ]
+STEPS = [f"{i} - {label}" for i, (_, label) in enumerate(PAGES, start=1)]
+_STEP_INDEX = {key: i for i, (key, _) in enumerate(PAGES, start=1)}
+
+
+def step_ref(key: str, full: bool = False) -> str:
+    """Human reference to a workflow page, e.g. ``step 6`` or ``step 6 (Wavelet)``."""
+    index = _STEP_INDEX[key]
+    label = PAGES[index - 1][1]
+    return f"step {index} ({label})" if full else f"step {index}"
+
+
+def step_header(key: str) -> str:
+    return STEPS[_STEP_INDEX[key] - 1]
 
 DEFAULTS = {
     "volume": None,
@@ -213,7 +231,7 @@ def sidebar() -> str:
 # ==========================================================================
 
 def page_data() -> None:
-    st.header("1 - Data")
+    st.header(step_header("data"))
     st.caption(
         "Load a 3D post-stack SEG-Y and the wells to calibrate it against. "
         "Wells are assumed already tied upstream; a bulk shift is available on the next step."
@@ -357,7 +375,7 @@ def _folder_loader() -> None:
         invalidate("wavelet", "colour_operator", "lfm", "result")
         log(f"folder scan: {len(scan.wells)} wells from {folder}")
         flash(f"Loaded {len(scan.wells)} wells from the folder - "
-              "review them on step 2 (Log QC).")
+              "review them on " + step_ref("logqc", full=True) + ".")
 
     _folder_scan_report()
 
@@ -485,13 +503,13 @@ def _las_loader() -> None:
 
     st.caption(
         "Curve roles and units are detected automatically on load and can be corrected on "
-        "**step 2 - Log QC**, so a well with unusual mnemonics still loads here.")
+        "**" + step_ref("logqc", full=True) + "**, so a well with unusual mnemonics still loads here.")
 
     c1, c2, c3 = st.columns(3)
     sonic_unit = c1.selectbox(
         "Sonic unit hint", data_io.SONIC_UNITS,
         help="Only consulted where the LAS unit is blank and the magnitude is ambiguous "
-             "(slowness near 130-250). Correct any well individually on step 2.")
+             "(slowness near 130-250). Correct any well individually on " + step_ref("logqc") + ".")
     const_vp = c2.number_input("Fallback Vp (m/s) if no sonic", 0.0, 8000.0, 0.0, 100.0,
                                help="0 disables the fallback.")
     repl_v = c3.number_input("Replacement velocity (m/s)", 500.0, 6000.0, 2500.0, 100.0,
@@ -516,7 +534,8 @@ def _las_loader() -> None:
             st.error("Some files could not be loaded:\n\n" + "\n\n".join(errors))
         elif wells:
             flagged = sum(1 for w in wells if any(sev == "error" for sev, _ in w.qc_flags()))
-            note = f" {flagged} need attention on step 2 - Log QC." if flagged else ""
+            note = (" " + str(flagged) + " need attention on "
+                    + step_ref("logqc", full=True) + ".") if flagged else ""
             flash(f"Loaded {len(wells)} wells.{note}")
 
 
@@ -604,7 +623,8 @@ def _aux_well_files() -> None:
         else:
             # flash() reruns, so the per-file detail has to travel with it or
             # it would be wiped by the redraw.
-            flash(f"Attached {len(applied)} well files - check them on step 2 (Log QC).\n\n{detail}")
+            flash(f"Attached {len(applied)} well files - check them on "
+                  + step_ref("logqc", full=True) + f".\n\n{detail}")
 
 
 def _optional_files() -> None:
@@ -640,15 +660,236 @@ def _optional_files() -> None:
 
 
 # ==========================================================================
+# Seismic viewer
+# ==========================================================================
+
+COLOURSCALES = ["RdBu", "Greys", "RdGy", "Picnic", "Portland", "Viridis", "Cividis"]
+
+
+def page_seismic() -> None:
+    st.header(step_header("seismic"))
+    vol = st.session_state.volume
+    ties = st.session_state.ties
+    if vol is None:
+        st.info("Load a volume on " + step_ref("data") + " first.")
+        return
+
+    st.caption("Browse the input volume before inverting it - amplitudes, structure, and "
+               "whether the wells sit where you expect.")
+
+    view = st.radio("View", ["Inline", "Crossline", "Time slice", "Traverse through wells"],
+                    horizontal=True)
+
+    c1, c2, c3 = st.columns(3)
+    gain = c1.slider("Gain", 0.2, 8.0, 1.0, 0.1,
+                     help="Multiplies the display range; it does not change the data.")
+    clip = c2.slider("Clip percentile", 90.0, 100.0, 99.0, 0.5,
+                     help="Amplitude at this percentile becomes full colour.")
+    scale = c3.selectbox("Colour scale", COLOURSCALES)
+
+    if view == "Traverse through wells":
+        _traverse_view(vol, gain, clip, scale)
+        return
+    if view == "Time slice":
+        _time_slice_view(vol, ties, gain, clip, scale)
+        return
+
+    orientation = "inline" if view == "Inline" else "crossline"
+    lines = vol.iline if orientation == "inline" else vol.xline
+    tolerance = st.slider("Project wells within (bins)", 0, 25, 3,
+                          help="How far from the line a well may sit and still be drawn on it. "
+                               "Projecting a well from far away would misrepresent where it is.")
+
+    line = st.select_slider(f"{orientation} number", options=[int(v) for v in lines],
+                            value=int(lines[len(lines) // 2]), key="seisview_line")
+    index = int(np.argmin(np.abs(np.asarray(lines) - line)))
+    axis_values = vol.xline if orientation == "inline" else vol.iline
+    overlay = viz.well_overlay_positions(ties, orientation, index, vol, tolerance=tolerance)
+
+    st.plotly_chart(
+        viz.section_figure(vol.data, vol.twt, axis_values, orientation, index,
+                           title=f"{orientation} {line}", colorscale=scale,
+                           clip_percentile=clip, gain=gain, wells=overlay, height=580),
+        width="stretch")
+
+    if ties and not overlay:
+        st.caption("No well within the projection distance of this line.")
+    elif overlay:
+        st.caption("Wells shown: " + ", ".join(w["name"] for w in overlay))
+
+    with st.expander("Amplitude statistics for this line"):
+        section = vol.data[index, :, :] if orientation == "inline" else vol.data[:, index, :]
+        finite = np.asarray(section, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        dead = int(np.sum(np.nanmax(np.abs(section), axis=1) == 0)) if finite.size else 0
+        st.dataframe(kv_table({
+            "traces": section.shape[0],
+            "dead traces": dead,
+            "min": f"{finite.min():.4g}" if finite.size else "n/a",
+            "max": f"{finite.max():.4g}" if finite.size else "n/a",
+            "RMS": f"{np.sqrt(np.mean(finite ** 2)):.4g}" if finite.size else "n/a",
+            "p99 |amp|": f"{np.percentile(np.abs(finite), 99):.4g}" if finite.size else "n/a",
+        }), width="stretch")
+
+
+def _time_slice_view(vol, ties, gain, clip, scale) -> None:
+    t_ms = st.select_slider("TWT (ms)", options=[float(t) for t in vol.twt],
+                            value=float(vol.twt[len(vol.twt) // 2]), key="seisview_slice")
+    st.plotly_chart(
+        viz.time_slice_figure(
+            vol.data, vol.twt, vol.iline, vol.xline, t_ms,
+            title=f"Time slice at {t_ms:.0f} ms", colorscale=scale, symmetric=True,
+            clip_percentile=clip,
+            wells=[{"name": t.well, "iline": int(vol.iline[t.il_index]),
+                    "xline": int(vol.xline[t.xl_index])} for t in ties]),
+        width="stretch")
+    st.caption("Well symbols mark the bin each well ties to, not its exact map position.")
+
+
+def _traverse_view(vol, gain, clip, scale) -> None:
+    """Seismic along a polyline through chosen wells."""
+    wells = [w for w in st.session_state.wells if w.has_location]
+    if len(wells) < 2:
+        st.warning("A traverse needs at least two located wells.")
+        return
+
+    names = [w.name for w in wells]
+    order = st.multiselect(
+        "Wells along the traverse (in order)", names, default=names,
+        help="The path follows the order you pick them in - reorder by clearing and "
+             "re-selecting.")
+    if len(order) < 2:
+        st.info("Pick at least two wells.")
+        return
+
+    try:
+        line = data_io.line_through_wells(vol, wells, order)
+    except Exception as exc:  # noqa: BLE001
+        show_error(exc, "Could not build the traverse")
+        return
+
+    st.plotly_chart(
+        viz.arbitrary_line_figure(line, title="Traverse: " + " - ".join(order),
+                                  colorscale=scale, clip_percentile=clip, gain=gain),
+        width="stretch")
+    st.dataframe(kv_table(line.summary()), width="stretch")
+    st.caption("Traces are taken at the nearest bin rather than interpolated, so the section "
+               "shows real traces the survey recorded.")
+
+
+# ==========================================================================
+# Well correlation
+# ==========================================================================
+
+def page_correlation() -> None:
+    st.header(step_header("correlation"))
+    wells = st.session_state.wells
+    ties = st.session_state.ties
+    if not wells:
+        st.info("Load some wells on " + step_ref("data") + " first.")
+        return
+
+    st.caption("Wells side by side in an order you choose, with their logs, formation tops and "
+               "the seismic trace extracted at each one.")
+
+    names = [w.name for w in wells]
+    order = st.multiselect(
+        "Wells and their order", names, default=names,
+        help="Wells appear left to right in the order you select them. To reorder, clear the "
+             "selection and pick them again in the order you want.")
+    if not order:
+        st.info("Select at least one well.")
+        return
+
+    chosen = [w for w in wells if w.name in order]
+    c1, c2, c3 = st.columns(3)
+    curve = c1.selectbox("Log curve", viz.common_curves(wells, order),
+                         help="Only curves present in every selected well are offered, plus the "
+                              "derived AI, Vp and Rho.")
+    show_logs = c2.checkbox("Show logs", value=True)
+    show_seismic = c3.checkbox("Show seismic traces", value=bool(ties))
+
+    shared_markers = viz.common_markers(wells, order)
+    c4, c5 = st.columns([2, 1])
+    datum = c4.selectbox(
+        "Flatten on", ["(hang on TWT)"] + shared_markers,
+        help="Only markers present in at least two selected wells are offered - a top in a "
+             "single well cannot be correlated.")
+    gain = c5.slider("Seismic gain", 0.2, 5.0, 1.0, 0.1, disabled=not show_seismic)
+
+    picked_markers = st.multiselect(
+        "Markers to draw", shared_markers, default=shared_markers[:8],
+        help="Correlation lines join the same marker between adjacent wells.")
+
+    if show_seismic and not ties:
+        st.warning("No seismic traces available - load a volume and locate the wells first. "
+                   "Logs and markers are shown on their own.")
+        show_seismic = False
+
+    gate = get_gate() if st.session_state.volume is not None else None
+    limit = st.checkbox("Limit to the analysis gate", value=False,
+                        disabled=gate is None,
+                        help=None if gate is None else
+                        f"Gate is {gate[0]:.0f} - {gate[1]:.0f} ms (set in the sidebar).")
+
+    try:
+        fig = viz.correlation_figure(
+            chosen, order, ties,
+            curve=curve, show_logs=show_logs, show_seismic=show_seismic,
+            flatten_marker=None if datum.startswith("(") else datum,
+            t_min=gate[0] if (limit and gate) else None,
+            t_max=gate[1] if (limit and gate) else None,
+            gain=gain, marker_names=picked_markers or None,
+            height=820)
+    except Exception as exc:  # noqa: BLE001
+        show_error(exc, "Could not build the correlation panel")
+        return
+
+    st.plotly_chart(fig, width="stretch")
+
+    missing = [n for n in order if n not in {t.well for t in ties}]
+    if show_seismic and missing:
+        st.caption("No seismic trace for: " + ", ".join(missing)
+                   + " (these wells have no map location).")
+
+    with st.expander("Wells in this panel"):
+        rows = []
+        for name in order:
+            well = next(w for w in chosen if w.name == name)
+            tie = next((t for t in ties if t.well == name), None)
+            t0, t1 = well.time_range()
+            rows.append({
+                "well": name,
+                "TWT range (ms)": f"{t0:.0f} - {t1:.0f}" if np.isfinite(t0) else "-",
+                "markers": len(well.markers),
+                "seismic at": f"IL {tie.iline} / XL {tie.xline}" if tie else "-",
+                "distance to bin (m)": round(tie.distance, 1) if tie else None,
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    if st.session_state.volume is not None and len(order) >= 2:
+        with st.expander("Seismic traverse along these wells"):
+            st.caption("The same wells, in the same order, as a continuous seismic section.")
+            try:
+                line = data_io.line_through_wells(st.session_state.volume, wells, order)
+                st.plotly_chart(
+                    viz.arbitrary_line_figure(line, title="Traverse: " + " - ".join(order),
+                                              gain=gain, height=460),
+                    width="stretch")
+            except Exception as exc:  # noqa: BLE001
+                st.caption(f"Traverse unavailable: {exc}")
+
+
+# ==========================================================================
 # Step 2 -- Log QC and curve assignment
 # ==========================================================================
 
 def page_log_qc() -> None:
-    st.header("2 - Log QC")
+    st.header(step_header("logqc"))
     wells = st.session_state.wells
     vol = st.session_state.volume
     if not wells:
-        st.info("Load some wells on step 1 first.")
+        st.info("Load some wells on " + step_ref("data") + " first.")
         return
 
     st.caption(
@@ -707,7 +948,7 @@ def _aux_file_status(well) -> None:
     """Show what the time-depth, deviation and marker files contributed."""
     if not (well.time_depth or well.track or well.markers):
         st.caption("No time-depth, deviation or marker file attached "
-                   "(upload them on step 1).")
+                   "(upload them on " + step_ref("data") + ").")
         return
 
     st.divider()
@@ -928,14 +1169,14 @@ def _curve_assignment_form(well, vol) -> None:
 # ==========================================================================
 
 def page_well_tie() -> None:
-    st.header("3 - Well tie QC")
+    st.header(step_header("tie"))
     vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
     if vol is None or not wells:
         st.info("Load a volume and at least one well first.")
         return
     if not ties:
         st.warning("No well has an X/Y location, so no seismic trace can be extracted. "
-                   "Upload a well-header CSV on step 1.")
+                   "Upload a well-header CSV on " + step_ref("data") + ".")
         return
 
     st.caption(
@@ -957,7 +1198,7 @@ def page_well_tie() -> None:
     qc_wavelet = st.session_state.wavelet
     if qc_wavelet is None:
         with c2:
-            st.info("No wavelet yet - QC uses a provisional Ricker. Build a wavelet on step 4 "
+            st.info("No wavelet yet - QC uses a provisional Ricker. Build a wavelet on " + step_ref("wavelet") + " "
                     "and return here to see the real fit.")
         freq = st.slider("Provisional Ricker frequency (Hz)", 5, 80, 25)
         qc_samples = wvl.ricker(freq, 128.0, vol.dt)
@@ -1012,7 +1253,7 @@ def page_well_tie() -> None:
 # ==========================================================================
 
 def page_wavelet() -> None:
-    st.header("4 - Wavelet")
+    st.header(step_header("wavelet"))
     vol, ties = st.session_state.volume, st.session_state.ties
     if vol is None:
         st.info("Load a volume first.")
@@ -1130,7 +1371,7 @@ def page_wavelet() -> None:
 # ==========================================================================
 
 def page_low_freq() -> None:
-    st.header("5 - Low-frequency model")
+    st.header(step_header("lfm"))
     vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
     if vol is None or not wells:
         st.info("Load a volume and wells first.")
@@ -1143,7 +1384,8 @@ def page_low_freq() -> None:
 
     located = [w for w in wells if w.has_location]
     if not located:
-        st.warning("No well has an X/Y location. Upload a well-header CSV on step 1.")
+        st.warning("No well has an X/Y location. Upload a well-header CSV on "
+                   + step_ref("data") + ".")
         return
 
     c1, c2, c3 = st.columns(3)
@@ -1164,7 +1406,7 @@ def page_low_freq() -> None:
             help="Interpolates in horizon-flattened time so the trend follows structure.")
     else:
         st.caption("No horizons loaded - interpolation is done on flat time slices, which is only "
-                   "defensible where structure is gentle. Load horizons on step 1 to improve this.")
+                   "defensible where structure is gentle. Load horizons on " + step_ref("data") + " to improve this.")
 
     if st.button("Build low-frequency model", type="primary"):
         bar = st.progress(0.0, text="Interpolating...")
@@ -1260,7 +1502,7 @@ class BackgroundJob:
 
 
 def page_inversion() -> None:
-    st.header("6 - Inversion")
+    st.header(step_header("inversion"))
     vol, ties, wav, model = (st.session_state.volume, st.session_state.ties,
                              st.session_state.wavelet, st.session_state.lfm)
     if vol is None:
@@ -1290,7 +1532,7 @@ def page_inversion() -> None:
         params["merge_freq"] = c3.slider("Merge frequency (Hz)", 2.0, 25.0, 10.0, 0.5,
                                          help="Where the inverted band is spliced onto the model.")
         if wav is None:
-            ready, blockers = False, blockers + ["a wavelet (step 4)"]
+            ready, blockers = False, blockers + ["a wavelet (" + step_ref("wavelet") + ")"]
         if model is None:
             st.info("Without a low-frequency model the output is relative impedance only.")
     else:
@@ -1304,9 +1546,9 @@ def page_inversion() -> None:
                                          help="Hard bound per sample; 0.35 is roughly +/-42% in impedance.")
         params["merge_freq"] = c5.slider("Merge frequency (Hz)", 2.0, 25.0, 10.0, 0.5)
         if wav is None:
-            ready, blockers = False, blockers + ["a wavelet (step 4)"]
+            ready, blockers = False, blockers + ["a wavelet (" + step_ref("wavelet") + ")"]
         if model is None:
-            ready, blockers = False, blockers + ["a low-frequency model (step 5)"]
+            ready, blockers = False, blockers + ["a low-frequency model (" + step_ref("lfm") + ")"]
 
     if not ready:
         st.warning("This method still needs: " + ", ".join(blockers) + ".")
@@ -1362,7 +1604,7 @@ def _coloured_controls(vol, ties, params):
     if not ties:
         st.warning("Coloured inversion fits its target spectrum to well reflectivity, so it needs "
                    "at least one located, tied well.")
-        return params, False, ["a located, tied well (step 1)"]
+        return params, False, ["a located, tied well (" + step_ref("data") + ")"]
 
     if st.button("Design operator"):
         try:
@@ -1399,7 +1641,7 @@ def _run_inline(vol, method, wav_samples, model, params, il_range, xl_range, lab
         st.session_state.result = result
         log(f"{label} {method}: {result.summary()['traces inverted']} traces in {result.elapsed_s:.1f}s")
         flash(f"{label.capitalize()} complete in {result.elapsed_s:.1f} s. "
-              "See step 7 for sections, crossplot and export.")
+              "See " + step_ref("results") + " for sections, crossplot and export.")
     except Exception as exc:  # noqa: BLE001
         bar.empty()
         show_error(exc, f"{label.capitalize()} failed")
@@ -1429,7 +1671,7 @@ def _poll_job() -> None:
     st.session_state.result = result
     log(f"full volume complete in {result.elapsed_s:.1f}s")
     flash(f"Full volume complete in {result.elapsed_s:.1f} s. "
-          "See step 7 for sections, crossplot and export.")
+          "See " + step_ref("results") + " for sections, crossplot and export.")
 
 
 def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -> None:
@@ -1476,11 +1718,11 @@ def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -
 # ==========================================================================
 
 def page_results() -> None:
-    st.header("7 - Results & export")
+    st.header(step_header("results"))
     vol, ties, result, model = (st.session_state.volume, st.session_state.ties,
                                 st.session_state.result, st.session_state.lfm)
     if vol is None or result is None:
-        st.info("Run an inversion on step 6 first.")
+        st.info("Run an inversion on " + step_ref("inversion") + " first.")
         return
 
     st.dataframe(kv_table(result.summary()),
@@ -1586,7 +1828,7 @@ def _crossplot_section(vol, ties, result) -> None:
                                              t_min=gate[0], t_max=gate[1])
     if not crossplot:
         st.warning("No well falls inside the inverted block (or the gate contains no valid log "
-                   "samples). Widen the subset on step 6 or the gate in the sidebar.")
+                   "samples). Widen the subset on " + step_ref("inversion") + " or the gate in the sidebar.")
         return
 
     missing = [t.well for t in ties if t.well not in crossplot]
@@ -1664,15 +1906,18 @@ def main() -> None:
     init_state()
     step = sidebar()
     show_flash()
-    {
-        STEPS[0]: page_data,
-        STEPS[1]: page_log_qc,
-        STEPS[2]: page_well_tie,
-        STEPS[3]: page_wavelet,
-        STEPS[4]: page_low_freq,
-        STEPS[5]: page_inversion,
-        STEPS[6]: page_results,
-    }[step]()
+    routes = {
+        "data": page_data,
+        "seismic": page_seismic,
+        "logqc": page_log_qc,
+        "correlation": page_correlation,
+        "tie": page_well_tie,
+        "wavelet": page_wavelet,
+        "lfm": page_low_freq,
+        "inversion": page_inversion,
+        "results": page_results,
+    }
+    routes[PAGES[STEPS.index(step)][0]]()
 
 
 if __name__ == "__main__":
