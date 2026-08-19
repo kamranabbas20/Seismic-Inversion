@@ -219,11 +219,18 @@ def page_data() -> None:
         "Wells are assumed already tied upstream; a bulk shift is available on the next step."
     )
 
-    source = st.radio("Data source", ["Synthetic demo dataset", "Upload SEG-Y + LAS"],
-                      horizontal=True)
+    source = st.radio(
+        "Data source",
+        ["Synthetic demo dataset", "Well folder (F3 demo layout)", "Upload SEG-Y + LAS"],
+        horizontal=True,
+        captions=["Generated in memory, no files needed",
+                  "Point at a folder of Lasfiles / Checkshot / Track / Tops",
+                  "Upload files one at a time"])
 
     if source == "Synthetic demo dataset":
         _synthetic_loader()
+    elif source.startswith("Well folder"):
+        _folder_loader()
     else:
         _segy_loader()
         _las_loader()
@@ -303,11 +310,110 @@ def _synthetic_loader() -> None:
         flash(f"Generated {vol.shape[0]} x {vol.shape[1]} x {vol.shape[2]} with {len(wells)} wells.")
 
 
+def _folder_loader() -> None:
+    """Load a whole well database from a directory tree, F3-demo style."""
+    st.markdown(
+        "Point at the folder that **contains** the per-type subfolders. Files are identified "
+        "by their contents and matched to wells by filename, so the folder names are only a "
+        "tie-breaker and extra folders do no harm."
+    )
+    st.code("F3Demo/\n  Lasfiles/   F02-1.las ...\n  Checkshot/  F02-1_TD.txt ...\n"
+            "  Track/      F02-1.track ...\n  Tops/       F02-1_markers.txt ...", language=None)
+
+    folder = st.text_input(
+        "Folder containing the well data",
+        value=st.session_state.get("_well_folder", ""),
+        placeholder=r"C:\Users\kamra\Desktop\F3Demo",
+        help="The parent folder. Subfolders are scanned to three levels deep.")
+
+    # A SEG-Y picked from a previous folder must not follow the user to a new one.
+    if folder != st.session_state.get("_last_folder_box"):
+        st.session_state._last_folder_box = folder
+        st.session_state.pop("_prefill_segy", None)
+        st.session_state.pop("_folder_scan", None)
+
+    c1, c2, c3 = st.columns(3)
+    time_unit = c1.selectbox("Checkshot time unit", ["auto"] + list(data_io.TIME_UNITS), key="folder_tu")
+    sonic_hint = c2.selectbox("Sonic unit hint", data_io.SONIC_UNITS, key="folder_su",
+                              help="Only used where a LAS unit is blank and the magnitude is ambiguous.")
+    prefer_td = c3.checkbox("Checkshot is the time source", value=True, key="folder_td")
+
+    if folder and st.button("Scan folder and load wells", type="primary"):
+        try:
+            with st.spinner("Scanning..."):
+                scan = data_io.scan_well_folder(
+                    folder, time_unit=time_unit, prefer_checkshot=prefer_td,
+                    sonic_unit_hint=sonic_hint)
+        except Exception as exc:  # noqa: BLE001
+            show_error(exc, "Folder scan failed")
+            return
+
+        st.session_state.wells = scan.wells
+        st.session_state._well_folder = folder
+        st.session_state._folder_scan = {
+            "summary": scan.summary(), "folders": scan.folders,
+            "attached": scan.attached, "skipped": scan.skipped}
+        rebuild_ties("wells loaded from folder")
+        invalidate("wavelet", "colour_operator", "lfm", "result")
+        log(f"folder scan: {len(scan.wells)} wells from {folder}")
+        flash(f"Loaded {len(scan.wells)} wells from the folder - "
+              "review them on step 2 (Log QC).")
+
+    _folder_scan_report()
+
+    st.divider()
+    st.subheader("Seismic volume")
+    st.caption("Wells come from the folder; the seismic volume is loaded here.")
+    found = _find_segy_cached(folder) if folder else []
+    if found:
+        st.caption(f"{len(found)} SEG-Y file(s) found under this folder.")
+        pick = st.selectbox("SEG-Y found in the folder", ["(use the loader below)"] + found)
+        if pick != "(use the loader below)":
+            st.session_state._prefill_segy = pick
+    _segy_loader()
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _find_segy_cached(folder: str) -> list[str]:
+    """Cached SEG-Y search, so the tree is not walked on every rerun.
+
+    Streamlit re-runs the whole script for each widget interaction, and a
+    survey folder can sit on a slow network drive.
+    """
+    try:
+        return data_io.find_segy_files(folder)
+    except Exception:  # noqa: BLE001 - an unreadable folder is not an error here
+        return []
+
+
+def _folder_scan_report() -> None:
+    """Show what the last folder scan found, matched and skipped."""
+    report = st.session_state.get("_folder_scan")
+    if not report:
+        return
+    st.divider()
+    st.subheader("Scan report")
+    st.dataframe(kv_table(report["summary"]), width="stretch")
+
+    if report["folders"]:
+        rows = [{"folder": name, "read as": role} for name, role in sorted(report["folders"].items())]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    with st.expander(f"Attached ({len(report['attached'])} files)"):
+        st.markdown("\n".join(f"- {m}" for m in report["attached"]) or "_nothing_")
+    if report["skipped"]:
+        with st.expander(f"Skipped ({len(report['skipped'])} files)"):
+            st.markdown("\n".join(f"- {m}" for m in report["skipped"]))
+            st.caption("Skipped files are listed so a file that did not load is visible "
+                       "rather than merely absent.")
+
+
 def _segy_loader() -> None:
     st.subheader("SEG-Y volume")
 
     mode = st.radio(
         "Source", ["Upload a file", "Path on this machine"], horizontal=True,
+        index=1 if st.session_state.get("_prefill_segy") else 0,
         help="Browser upload is capped at 1 GB and holds the file in memory while it "
              "transfers. For large volumes, pointing at a path on the machine running "
              "the app skips both.")
@@ -320,6 +426,7 @@ def _segy_loader() -> None:
     else:
         local_path = st.text_input(
             "Full path to the SEG-Y file",
+            value=st.session_state.get("_prefill_segy", ""),
             placeholder=r"C:\data\survey\poststack.sgy",
             help="Read directly from disk - no size limit and nothing held in memory twice.")
 

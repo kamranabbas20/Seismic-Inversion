@@ -1455,6 +1455,203 @@ def match_well_name(filename: str, well_names: Sequence[str]) -> str | None:
     return max(candidates, key=lambda n: len(normalised[n])) if candidates else None
 
 
+# ==========================================================================
+# Folder scan: load a whole well database from a directory tree
+# ==========================================================================
+
+# Folder-name hints, used only to break ties -- the contents decide.
+_FOLDER_HINTS = {
+    "time_depth": ("checkshot", "check shot", "checkshots", "td", "time-depth",
+                   "timedepth", "time_depth", "tz", "t-d"),
+    "track": ("track", "tracks", "deviation", "deviations", "survey", "path", "dev"),
+    "markers": ("tops", "top", "marker", "markers", "picks", "horizons_well"),
+    "las": ("las", "lasfiles", "las files", "logs", "wells", "welllogs", "well logs"),
+}
+
+# Extensions worth opening during a scan. Anything else is left alone so a
+# stray SEG-Y in the tree is never read as a text file.
+_SCAN_EXTENSIONS = {".las", ".txt", ".csv", ".dat", ".track", ".asc", ".tz",
+                    ".md", ".prn", ".tab", ""}
+_MAX_SCAN_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class FolderScan:
+    """What a directory scan found, and what it managed to do with it."""
+
+    wells: list = field(default_factory=list)
+    attached: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    folders: dict[str, str] = field(default_factory=dict)
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def summary(self) -> dict:
+        return {
+            "wells loaded": len(self.wells),
+            "LAS files": self.counts.get("las", 0),
+            "checkshots": self.counts.get("time_depth", 0),
+            "deviation surveys": self.counts.get("track", 0),
+            "marker files": self.counts.get("markers", 0),
+            "files skipped": len(self.skipped),
+        }
+
+
+def _folder_role(name: str) -> str | None:
+    key = str(name).strip().lower().replace("_", " ")
+    for role, hints in _FOLDER_HINTS.items():
+        if any(key == h or key.replace(" ", "") == h.replace(" ", "") for h in hints):
+            return role
+    for role, hints in _FOLDER_HINTS.items():
+        if any(h in key for h in hints):
+            return role
+    return None
+
+
+def _classify(path: str, folder_role: str | None) -> tuple[str | None, str]:
+    """Decide what a file is.  Returns ``(kind, why)``.
+
+    Contents decide; the folder name only breaks a tie.  When the two disagree
+    the contents win and the disagreement is reported, because a file in the
+    wrong folder is far commoner than a file that lies about its own columns.
+    """
+    if os.path.splitext(path)[1].lower() == ".las":
+        return "las", "LAS extension"
+    try:
+        sniffed = sniff_well_file(path)
+    except Exception:  # noqa: BLE001 - unreadable file, leave it alone
+        return None, "could not be read as text"
+
+    if sniffed is None:
+        return (folder_role, f"no recognisable columns; taken from the '{folder_role}' folder")             if folder_role in WELL_FILE_KINDS else (None, "no recognisable columns")
+    if folder_role in WELL_FILE_KINDS and folder_role != sniffed:
+        return sniffed, f"contents look like {sniffed}, not {folder_role} as the folder suggests"
+    return sniffed, "from contents"
+
+
+def scan_well_folder(
+    root: str,
+    max_depth: int = 3,
+    time_unit: str = "auto",
+    prefer_checkshot: bool = True,
+    sonic_unit_hint: str = "us/ft",
+) -> FolderScan:
+    """Load a whole well database from a directory tree.
+
+    Built for the layout the F3 demo ships in -- one folder per data type
+    (``Lasfiles``, ``Checkshot``, ``Track``, ``Tops``) with one file per well
+    inside each -- but it does not depend on those names.  Files are classified
+    by contents, folder names only break ties, and wells are keyed off the LAS
+    files, since those carry the logs everything else decorates.
+
+    Unrecognised folders and files are reported rather than ignored silently,
+    so a file that did not load is visible instead of merely absent.
+    """
+    root = os.path.abspath(os.path.expanduser(str(root)))
+    if not os.path.isdir(root):
+        raise ValueError(f"not a folder: {root}")
+
+    scan = FolderScan()
+    candidates: list[tuple[str, str | None]] = []
+
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath.rstrip(os.sep).count(os.sep) - root_depth >= max_depth:
+            dirnames[:] = []
+        role = _folder_role(os.path.basename(dirpath)) if dirpath != root else None
+        if dirpath != root:
+            scan.folders[os.path.relpath(dirpath, root)] = role or "unrecognised"
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            full = os.path.join(dirpath, filename)
+            if os.path.splitext(filename)[1].lower() not in _SCAN_EXTENSIONS:
+                continue
+            try:
+                if os.path.getsize(full) > _MAX_SCAN_BYTES:
+                    scan.skipped.append(f"{os.path.relpath(full, root)} (too large to scan)")
+                    continue
+            except OSError:
+                continue
+            candidates.append((full, role))
+
+    # --- pass 1: LAS files define the wells ------------------------------
+    aux: list[tuple[str, str, str]] = []
+    for full, role in candidates:
+        kind, why = _classify(full, role)
+        rel = os.path.relpath(full, root)
+        if kind is None:
+            scan.skipped.append(f"{rel} ({why})")
+            continue
+        if kind == "las":
+            try:
+                well = load_las(full, name=os.path.splitext(os.path.basename(full))[0],
+                                sonic_unit=sonic_unit_hint)
+                scan.wells.append(well)
+                scan.counts["las"] = scan.counts.get("las", 0) + 1
+                scan.attached.append(f"{rel} -> well **{well.name}**")
+            except Exception as exc:  # noqa: BLE001 - one bad LAS must not stop the scan
+                scan.skipped.append(f"{rel} ({exc})")
+        else:
+            aux.append((full, kind, why))
+
+    if not scan.wells:
+        raise ValueError(
+            f"no LAS files found under {root}. Expected a folder of .las files "
+            "(the scan keys wells off the logs, then matches the other files to them)."
+        )
+
+    # --- pass 2: attach everything else to those wells -------------------
+    names = [w.name for w in scan.wells]
+    for full, kind, why in aux:
+        rel = os.path.relpath(full, root)
+        target = match_well_name(os.path.basename(full), names)
+        if target is None:
+            scan.skipped.append(f"{rel} (no well matched; wells are {', '.join(names)})")
+            continue
+        well = next(w for w in scan.wells if w.name == target)
+        try:
+            if kind == "time_depth":
+                message = well.attach_time_depth(
+                    load_time_depth(full, time_unit=time_unit, source=rel), prefer=prefer_checkshot)
+            elif kind == "track":
+                message = well.attach_track(load_well_track(full, source=rel))
+            else:
+                message = well.attach_markers(load_markers(full, source=rel))
+            scan.counts[kind] = scan.counts.get(kind, 0) + 1
+            note = f" ({why})" if why != "from contents" else ""
+            scan.attached.append(f"{rel} -> **{target}**: {message}{note}")
+        except Exception as exc:  # noqa: BLE001
+            scan.skipped.append(f"{rel} ({exc})")
+
+    scan.wells.sort(key=lambda w: w.name)
+    return scan
+
+
+def find_segy_files(root: str, max_depth: int = 3, limit: int = 40) -> list[str]:
+    """List SEG-Y files under a folder, largest first.
+
+    Offered alongside a well-folder scan so a survey that keeps its seismic
+    beside its wells can be loaded without retyping the path.
+    """
+    root = os.path.abspath(os.path.expanduser(str(root)))
+    if not os.path.isdir(root):
+        return []
+    found: list[tuple[int, str]] = []
+    root_depth = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath.rstrip(os.sep).count(os.sep) - root_depth >= max_depth:
+            dirnames[:] = []
+        for filename in filenames:
+            if os.path.splitext(filename)[1].lower() in (".sgy", ".segy"):
+                full = os.path.join(dirpath, filename)
+                try:
+                    found.append((os.path.getsize(full), full))
+                except OSError:
+                    continue
+    found.sort(reverse=True)
+    return [path for _, path in found[:limit]]
+
+
 def load_well_headers(path_or_buffer) -> pd.DataFrame:
     """Read a well-header CSV (name/uwi + X/Y + optional KB).
 

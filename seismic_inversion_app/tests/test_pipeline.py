@@ -749,6 +749,115 @@ def test_every_summary_is_arrow_serialisable():
             raise AssertionError(f"{name} is not Arrow-serialisable: {exc}") from exc
 
 
+def _build_well_folder(root: str, wells=("F02-1", "F03-2", "F03-4")) -> str:
+    """Create an F3-demo-shaped well folder on disk."""
+    import lasio
+
+    for sub in ("Lasfiles", "Checkshot", "Track", "Tops", "Notes"):
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+
+    rng = np.random.default_rng(5)
+    for k, name in enumerate(wells):
+        md = np.arange(30.0 + 50 * k, 1800.0, 0.5)
+        vp = 1800 + 0.3 * md + rng.normal(0, 20, md.size)
+        rho = 1900 + 0.17 * md + rng.normal(0, 10, md.size)
+        las = lasio.LASFile()
+        las.well["WELL"] = lasio.HeaderItem("WELL", value=name)
+        las.append_curve("DEPT", md, unit="m")
+        las.append_curve("DT", 1e6 / (vp * utils.FT_PER_M), unit="us/ft")
+        las.append_curve("RHOB", rho / 1000.0, unit="g/cm3")
+        las.write(os.path.join(root, "Lasfiles", f"{name}.las"), version=2.0)
+
+        depths = np.array([30.0, 500.0, 1000.0, 1500.0, 1800.0])
+        times = np.interp(depths, [30, 1800], [0.0, 1.85])
+        with open(os.path.join(root, "Checkshot", f"{name}_TD.txt"), "w") as fh:
+            fh.writelines(f"{d}\t{t:.4f}\n" for d, t in zip(depths, times))
+        with open(os.path.join(root, "Track", f"{name}.track"), "w") as fh:
+            fh.write(f"{606000 + k * 900}\t{6080000 + k * 1200}  -30       0\n")
+            fh.write(f"{606000 + k * 900}\t{6080000 + k * 1200}\t1770\t1800\n")
+        with open(os.path.join(root, "Tops", f"{name}_markers.txt"), "w") as fh:
+            fh.write("420\tMFS11\r\n760\tTruncation 1\r\n1180\tFS 3\r\n")
+
+    with open(os.path.join(root, "Notes", "readme.txt"), "w") as fh:
+        fh.write("F3 Demo well data\nProvided by dGB Earth Sciences\n")
+    return root
+
+
+def test_folder_scan_loads_a_whole_well_database():
+    root = _build_well_folder(tempfile.mkdtemp())
+    scan = data_io.scan_well_folder(root)
+
+    assert len(scan.wells) == 3
+    assert scan.counts == {"las": 3, "markers": 3, "track": 3, "time_depth": 3}
+    for well in scan.wells:
+        assert well.has_location, f"{well.name} should be located by its track"
+        assert abs(well.kb - 30.0) < 1e-6
+        assert well.time_depth is not None
+        assert well.selection.time == data_io.TD_SOURCE
+        assert len(well.markers) == 3
+        assert all(m.twt is not None for m in well.markers)
+        assert not [m for sev, m in well.qc_flags() if sev == "error"]
+
+    assert scan.folders["Lasfiles"] == "las"
+    assert scan.folders["Checkshot"] == "time_depth"
+    assert scan.folders["Track"] == "track"
+    assert scan.folders["Tops"] == "markers"
+
+
+def test_folder_scan_reports_what_it_could_not_use():
+    """A file that did not load must be visible, not merely absent."""
+    root = _build_well_folder(tempfile.mkdtemp())
+    scan = data_io.scan_well_folder(root)
+    assert any("readme.txt" in m for m in scan.skipped), scan.skipped
+    assert len(scan.attached) == 12, scan.attached
+
+
+def test_folder_scan_trusts_contents_over_folder_name():
+    """A checkshot filed under Track must still be read as a checkshot."""
+    root = _build_well_folder(tempfile.mkdtemp(), wells=("F02-1",))
+    misfiled = os.path.join(root, "Track", "F02-1_TD.txt")
+    os.rename(os.path.join(root, "Checkshot", "F02-1_TD.txt"), misfiled)
+
+    scan = data_io.scan_well_folder(root)
+    assert scan.counts.get("time_depth") == 1, "contents should win over the folder name"
+    assert scan.wells[0].time_depth is not None
+    assert any("not track as the folder suggests" in m for m in scan.attached), scan.attached
+
+
+def test_folder_scan_survives_an_unreadable_las():
+    root = _build_well_folder(tempfile.mkdtemp(), wells=("F02-1", "F03-2"))
+    with open(os.path.join(root, "Lasfiles", "BROKEN.las"), "w") as fh:
+        fh.write("this is not a LAS file at all\n")
+    scan = data_io.scan_well_folder(root)
+    assert len(scan.wells) == 2, "the good wells should still load"
+    assert any("BROKEN.las" in m for m in scan.skipped), scan.skipped
+
+
+def test_folder_scan_needs_at_least_one_las():
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, "Checkshot"))
+    with open(os.path.join(root, "Checkshot", "F02-1_TD.txt"), "w") as fh:
+        fh.write("30\t0\n1800\t1.85\n")
+    try:
+        data_io.scan_well_folder(root)
+    except ValueError as exc:
+        assert "no LAS files" in str(exc)
+    else:
+        raise AssertionError("a folder with no logs should be rejected, not silently empty")
+
+
+def test_find_segy_files_orders_by_size():
+    root = _build_well_folder(tempfile.mkdtemp(), wells=("F02-1",))
+    small_vol, _ = data_io.make_synthetic_dataset(n_iline=5, n_xline=5, n_samples=60, n_wells=1)
+    big_vol, _ = data_io.make_synthetic_dataset(n_iline=10, n_xline=10, n_samples=200, n_wells=1)
+    small = os.path.join(root, "small.sgy")
+    big = os.path.join(root, "Lasfiles", "big.segy")
+    data_io.write_segy(small_vol, small)
+    data_io.write_segy(big_vol, big)
+    found = data_io.find_segy_files(root)
+    assert found[0] == big and small in found, found
+
+
 def test_bulk_shift_is_not_cumulative():
     _, wells = data_io.make_synthetic_dataset(n_iline=5, n_xline=5, n_samples=80, n_wells=1)
     well = wells[0]

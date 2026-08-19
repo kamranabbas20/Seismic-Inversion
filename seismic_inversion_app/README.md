@@ -69,7 +69,7 @@ background model fails.
 
 | Step | What it does |
 | --- | --- |
-| **1 - Data** | SEG-Y + byte positions (with a header scan to identify non-standard ones), multi-well LAS, time-depth / deviation / marker files, optional well-header and horizon CSVs. Or generate a synthetic dataset. |
+| **1 - Data** | Three sources: a synthetic dataset, a **well folder** scanned in one go (F3 demo layout), or file-by-file upload. SEG-Y with byte positions and a header scan, multi-well LAS, time-depth / deviation / marker files, optional well-header and horizon CSVs. |
 | **2 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks, checkshot / deviation / marker review. |
 | **3 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
 | **4 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
@@ -258,6 +258,35 @@ only has to be a good default.
 
 A well missing a density curve still loads, and shows up as a failed check to
 resolve here, rather than being rejected at the door and lost.
+
+---
+
+## Loading a whole well database from a folder
+
+Step 1 offers **Well folder (F3 demo layout)**: point at the folder that
+*contains* the per-type subfolders and every well loads at once, complete with
+its checkshot, deviation survey and tops.
+
+```
+F3Demo/
+  Lasfiles/    F02-1.las   F03-2.las   F03-4.las   F06-1.las
+  Checkshot/   F02-1_TD.txt        ...
+  Track/       F02-1.track         ...
+  Tops/        F02-1_markers.txt   ...
+```
+
+Wells are keyed off the **LAS files**, since those carry the logs everything
+else decorates; the rest are matched to them by filename. Folder names are only
+a tie-breaker — each file is classified by its *contents*, so a checkshot filed
+under `Track` is still read as a checkshot (and the app says so). Extra folders
+do no harm, and the layout above is a convention rather than a requirement.
+
+The scan reports what it **skipped** and why, not just what it loaded, so a
+file that failed to parse is visible rather than merely absent. Any SEG-Y found
+under the same folder is offered in a dropdown that fills in the volume path.
+
+A folder with no LAS files is rejected outright rather than loading as an empty
+well list.
 
 ---
 
