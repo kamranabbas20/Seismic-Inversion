@@ -284,7 +284,14 @@ def test_demo_files_round_trip_through_the_real_readers():
     wells = [data_io.load_las(p) for p in sorted(glob.glob(os.path.join(outdir, "*.las")))]
     assert len(wells) == 3
     assert all(w.valid_mask().sum() > 100 for w in wells)
-    assert all("already tied" in " ".join(w.notes) for w in wells), "LAS should carry a TWT curve"
+    # Assert on the resolved selection rather than note prose, which is UI text.
+    assert all(w.selection.time is not None for w in wells), "LAS should carry a TWT curve"
+    assert all(w.selection.sonic == "DT" for w in wells)
+    assert all(w.selection.density == "RHOB" for w in wells)
+    assert all(w.selection.sonic_unit == "us/ft" for w in wells), \
+        [w.selection.sonic_unit for w in wells]
+    assert all(w.selection.density_unit == "g/cm3" for w in wells), \
+        [w.selection.density_unit for w in wells]
 
     # Drop the locations so the header CSV has real work to do.
     for w in wells:
@@ -327,6 +334,176 @@ def test_short_trace_with_long_wavelet_survives():
         res = inversion.run_volume(vol, method, wav.samples, lfm, **extra)
         assert res.relative_ai.shape == vol.shape
     assert ties
+
+
+def _synthetic_las(curves: dict, units: list, name: str = "TEST"):
+    """Build an in-memory LAS with the given curves and unit strings."""
+    import io as _io
+
+    import lasio
+
+    las = lasio.LASFile()
+    las.well["WELL"] = lasio.HeaderItem("WELL", value=name)
+    dept = np.arange(1000.0, 1200.0, 0.5)
+    las.append_curve("DEPT", dept, unit="m")
+    for (mnemonic, value), unit in zip(curves.items(), units):
+        las.append_curve(mnemonic, np.full(dept.shape, float(value)), unit=unit)
+    buf = _io.StringIO()
+    las.write(buf, version=2.0)
+    buf.seek(0)
+    return buf
+
+
+def test_curve_autodetection_across_unit_conventions():
+    """Every combination must land on ~3000 m/s and ~2450 kg/m3."""
+    cases = [
+        ("us/ft + g/cm3", {"DT": 100.0, "RHOB": 2.45}, ["us/ft", "g/cm3"]),
+        ("us/m + kg/m3", {"DT": 328.084, "RHOB": 2450.0}, ["us/m", "kg/m3"]),
+        ("velocity in m/s", {"VP": 3000.0, "RHOB": 2.45}, ["m/s", "g/cm3"]),
+        ("velocity in ft/s", {"VP": 9842.5, "RHOB": 2.45}, ["ft/s", "g/cm3"]),
+        ("blank units, us/ft magnitude", {"DTCO": 100.0, "RHOZ": 2.45}, ["", ""]),
+        ("blank units, us/m magnitude", {"DTCO": 328.084, "RHOZ": 2450.0}, ["", ""]),
+    ]
+    for label, curves, units in cases:
+        well = data_io.load_las(_synthetic_las(curves, units), name="W")
+        vp = float(np.nanmedian(well.vp))
+        rho = float(np.nanmedian(well.rho))
+        assert abs(vp - 3000) < 60, f"{label}: Vp {vp:.0f}"
+        assert abs(rho - 2450) < 20, f"{label}: Rho {rho:.0f}"
+
+
+def test_las_unit_string_beats_magnitude():
+    """An explicit LAS unit must win over the magnitude heuristic."""
+    well = data_io.load_las(_synthetic_las({"DT": 328.084, "RHOB": 2.45}, ["us/ft", "g/cm3"]), name="W")
+    assert well.selection.sonic_unit == "us/ft"
+    assert abs(float(np.nanmedian(well.vp)) - 929) < 20, "should honour the (wrong) stated unit"
+
+
+def test_sonic_hint_only_breaks_genuine_ties():
+    """The hint must not override evidence -- only settle the ambiguous band."""
+    from modules.data_io import _guess_sonic_unit
+
+    values = np.full(50, 95.0)      # unambiguously us/ft
+    assert _guess_sonic_unit(values, "", hint="us/m") == "us/ft"
+    values = np.full(50, 310.0)     # unambiguously us/m
+    assert _guess_sonic_unit(values, "", hint="us/ft") == "us/m"
+    values = np.full(50, 160.0)     # genuinely ambiguous
+    assert _guess_sonic_unit(values, "", hint="us/m") == "us/m"
+    assert _guess_sonic_unit(values, "", hint=None) == "us/ft"
+
+
+def test_reassigning_curves_recomputes_the_logs():
+    """The whole point of the QC step: fix a unit, get corrected impedance."""
+    well = data_io.load_las(_synthetic_las({"DT": 100.0, "RHOB": 2.45}, ["us/ft", "g/cm3"]), name="W")
+    original_vp = float(np.nanmedian(well.vp))
+
+    # Reading us/ft slowness as us/m scales velocity *up* by ft-per-metre.
+    wrong = data_io.CurveSelection(sonic="DT", sonic_unit="us/m",
+                                   density="RHOB", density_unit="g/cm3")
+    well.apply_selection(wrong)
+    assert abs(float(np.nanmedian(well.vp)) - original_vp * utils.FT_PER_M) < 5
+
+    fixed = data_io.CurveSelection(sonic="DT", sonic_unit="us/ft",
+                                   density="RHOB", density_unit="g/cm3")
+    well.apply_selection(fixed)
+    assert abs(float(np.nanmedian(well.vp)) - original_vp) < 1e-6, "must be fully reversible"
+
+
+def test_qc_flags_catch_a_unit_mistake():
+    well = data_io.load_las(_synthetic_las({"DT": 100.0, "RHOB": 2.45}, ["us/ft", "g/cm3"]), name="W")
+    assert not [m for sev, m in well.qc_flags() if sev == "error"], "correct units should pass"
+
+    well.apply_selection(data_io.CurveSelection(sonic="DT", sonic_unit="us/m",
+                                                density="RHOB", density_unit="g/cm3"))
+    errors = [m for sev, m in well.qc_flags() if sev == "error"]
+    assert errors, "10,000 m/s should be flagged as implausible"
+    assert any("Vp" in m for m in errors), errors
+
+    well.apply_selection(data_io.CurveSelection(sonic="DT", sonic_unit="us/ft",
+                                                density="RHOB", density_unit="kg/m3"))
+    errors = [m for sev, m in well.qc_flags() if sev == "error"]
+    assert any("Density" in m for m in errors), errors
+
+
+def test_qc_flags_catch_no_seismic_overlap():
+    well = data_io.load_las(
+        _synthetic_las({"DT": 100.0, "RHOB": 2.45, "TWT": 4000.0}, ["us/ft", "g/cm3", "ms"]), name="W")
+    flags = well.qc_flags(seismic_twt=np.arange(0.0, 1000.0, 2.0))
+    assert any(sev == "error" and "overlap" in m for sev, m in flags), flags
+
+
+def test_bulk_shift_survives_reassignment():
+    well = data_io.load_las(
+        _synthetic_las({"DT": 100.0, "RHOB": 2.45, "TWT": 1500.0}, ["us/ft", "g/cm3", "ms"]), name="W")
+    well.set_bulk_shift(25.0)
+    before = float(np.nanmedian(well.twt))
+    well.apply_selection(well.selection)
+    assert abs(float(np.nanmedian(well.twt)) - before) < 1e-6, "reassignment must not drop the shift"
+
+
+def test_curve_inventory_lists_every_curve():
+    well = data_io.load_las(
+        _synthetic_las({"DT": 100.0, "RHOB": 2.45, "GR": 60.0}, ["us/ft", "g/cm3", "gAPI"]), name="W")
+    rows = {r["curve"]: r for r in well.curve_inventory()}
+    assert {"DEPT", "DT", "RHOB", "GR"} <= set(rows)
+    assert rows["DT"]["role"] == "Vp (sonic)"
+    assert rows["RHOB"]["role"] == "Density"
+    assert rows["GR"]["role"] == "", "an unassigned curve should still be listed"
+    assert rows["GR"]["LAS unit"] == "gAPI"
+    assert rows["DT"]["valid %"] == 100.0
+
+
+def test_well_without_density_still_loads():
+    """A missing curve is a QC flag to resolve in the UI, not a lost well."""
+    well = data_io.load_las(_synthetic_las({"DT": 100.0}, ["us/ft"]), name="W")
+    assert well.selection.density is None
+    assert "DT" in well.curves
+    assert any(sev == "error" for sev, _ in well.qc_flags())
+
+
+def test_log_qc_figures_build():
+    well = data_io.load_las(
+        _synthetic_las({"DT": 100.0, "RHOB": 2.45, "GR": 60.0}, ["us/ft", "g/cm3", "gAPI"]), name="W")
+    assert len(viz.log_qc_figure(well).data) > 0
+    assert len(viz.curve_preview_figure(well, ["DT", "RHOB"]).data) > 0
+    viz.curve_preview_figure(well, [])          # must not raise on an empty selection
+
+
+def test_upload_spill_is_byte_exact():
+    import hashlib
+    import io as _io
+
+    payload = os.urandom(3_000_000)
+    buf = _io.BytesIO(payload)
+    path = data_io.persist_upload(buf, chunk=64 * 1024)
+    try:
+        assert hashlib.sha256(open(path, "rb").read()).hexdigest() == \
+            hashlib.sha256(payload).hexdigest()
+        assert buf.tell() == 0, "buffer should be rewound for reuse"
+    finally:
+        os.unlink(path)
+
+
+def test_synthetic_wells_carry_curves_like_a_real_las():
+    """The demo path must exercise the same curve machinery as a loaded LAS.
+
+    Without this the log-QC step could not describe a synthetic well, and
+    applying an assignment there would clear logs it could not see.
+    """
+    vol, wells = data_io.make_synthetic_dataset(n_iline=6, n_xline=6, n_samples=150,
+                                                n_wells=2, seed=3)
+    for well in wells:
+        assert {"DT", "RHOB", "TWT"} <= set(well.curves)
+        assert well.selection.sonic == "DT" and well.selection.sonic_unit == "us/ft"
+        assert well.selection.density == "RHOB" and well.selection.density_unit == "g/cm3"
+        assert well.selection.time == "TWT"
+        assert well.curve_units["DT"] == "us/ft"
+        assert not [m for sev, m in well.qc_flags(vol.twt) if sev == "error"]
+
+        # Round-tripping the stored curves must reproduce the logs exactly.
+        vp_before = well.vp.copy()
+        well.apply_selection(well.selection)
+        assert np.allclose(well.vp, vp_before, rtol=1e-9)
 
 
 def test_bulk_shift_is_not_cumulative():

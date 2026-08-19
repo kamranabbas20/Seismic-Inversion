@@ -1,0 +1,14 @@
+# Streamlit runtime configuration for the seismic inversion app.
+# Applies automatically when the app is launched from this directory.
+
+[server]
+# 3D post-stack SEG-Y volumes routinely run to hundreds of megabytes, so the
+# 200 MB default rejects real surveys. 1 GB (value is in MB).
+#
+# Note that the browser upload path holds the file in memory while it
+# transfers; for volumes at the top of this range, the "load from a path on
+# this machine" option on step 1 avoids that entirely.
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false

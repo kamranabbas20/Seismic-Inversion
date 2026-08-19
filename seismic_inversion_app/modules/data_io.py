@@ -49,6 +49,59 @@ DEFAULT_BYTES = {
 # ==========================================================================
 
 @dataclass
+class CurveSelection:
+    """Which LAS curve fills each role, and the unit it is in.
+
+    Auto-detection fills this in on load; the log-QC step lets the user
+    override every field.  Keeping it as data (rather than baking the choice
+    into ``vp``/``rho`` at parse time) is what makes the reassignment possible
+    without re-reading the file.
+    """
+
+    sonic: str | None = None
+    sonic_unit: str = "us/ft"
+    density: str | None = None
+    density_unit: str = "g/cm3"
+    time: str | None = None
+    time_unit: str = "ms (TWT)"
+    constant_vp: float | None = None
+
+    def describe(self) -> str:
+        bits = []
+        bits.append(f"Vp: {self.sonic} [{self.sonic_unit}]" if self.sonic
+                    else (f"Vp: constant {self.constant_vp:.0f} m/s" if self.constant_vp else "Vp: none"))
+        bits.append(f"Rho: {self.density} [{self.density_unit}]" if self.density else "Rho: none")
+        bits.append(f"TWT: {self.time} [{self.time_unit}]" if self.time else "TWT: integrated from sonic")
+        return " | ".join(bits)
+
+
+def velocity_from_curve(values: np.ndarray, unit: str) -> np.ndarray:
+    """Convert a sonic *or* velocity curve to Vp in m/s, per the chosen unit."""
+    values = np.asarray(values, dtype=float)
+    unit = unit.lower().replace(" ", "")
+    if unit in ("m/s", "ms-1"):
+        out = values.copy()
+    elif unit in ("ft/s", "fts-1"):
+        out = values / utils.FT_PER_M
+    else:
+        return utils.sonic_to_velocity(values, unit=unit)
+    out[~np.isfinite(out) | (out <= 0)] = np.nan
+    return out
+
+
+def time_curve_to_twt_ms(values: np.ndarray, unit: str) -> np.ndarray:
+    """Normalise a time curve to two-way time in milliseconds."""
+    values = np.asarray(values, dtype=float).copy()
+    unit = unit.lower()
+    if "s (" in unit and "ms" not in unit:
+        values = values * 1000.0
+    if "owt" in unit:
+        values = values * 2.0
+    return values
+
+
+
+@dataclass
 class SeismicVolume:
     """A 3D post-stack volume held as ``(n_iline, n_xline, n_samples)``."""
 
@@ -180,6 +233,11 @@ class WellData:
     curves: dict[str, np.ndarray] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     bulk_shift: float = 0.0
+    # Raw LAS metadata, kept so the log-QC step can show what is actually in
+    # the file rather than only what auto-detection picked.
+    curve_units: dict[str, str] = field(default_factory=dict)
+    curve_descr: dict[str, str] = field(default_factory=dict)
+    selection: CurveSelection = field(default_factory=CurveSelection)
 
     def __post_init__(self) -> None:
         self.md = np.asarray(self.md, dtype=float)
@@ -199,6 +257,54 @@ class WellData:
         self.bulk_shift = float(milliseconds)
         self.twt = self._twt_base + float(milliseconds)
 
+    # -- curve assignment ------------------------------------------------
+    def apply_selection(
+        self,
+        selection: CurveSelection,
+        replacement_velocity: float = 2500.0,
+        seismic_datum: float = 0.0,
+    ) -> list[str]:
+        """Recompute Vp, Rho and TWT from a (possibly edited) curve selection.
+
+        Returns human-readable notes.  The bulk shift is re-applied afterwards
+        so reassigning the time curve does not silently drop a shift the user
+        set on the tie step.
+        """
+        notes: list[str] = []
+        self.selection = selection
+
+        if selection.sonic and selection.sonic in self.curves:
+            self.vp = velocity_from_curve(self.curves[selection.sonic], selection.sonic_unit)
+            notes.append(f"Vp from '{selection.sonic}' [{selection.sonic_unit}]")
+        elif selection.constant_vp:
+            self.vp = np.full(self.md.shape, float(selection.constant_vp))
+            notes.append(f"Vp constant at {selection.constant_vp:.0f} m/s")
+        else:
+            self.vp = np.full(self.md.shape, np.nan)
+            notes.append("No Vp source assigned")
+
+        if selection.density and selection.density in self.curves:
+            self.rho = utils.density_to_si(self.curves[selection.density], selection.density_unit)
+            notes.append(f"Rho from '{selection.density}' [{selection.density_unit}]")
+        else:
+            self.rho = np.full(self.md.shape, np.nan)
+            notes.append("No density curve assigned")
+
+        if selection.time and selection.time in self.curves:
+            base = time_curve_to_twt_ms(self.curves[selection.time], selection.time_unit)
+            notes.append(f"TWT from '{selection.time}' [{selection.time_unit}] (well assumed tied)")
+        else:
+            base = integrate_sonic_to_twt(
+                self.md, self.vp, kb=self.kb,
+                replacement_velocity=replacement_velocity, seismic_datum=seismic_datum)
+            notes.append("TWT integrated from Vp (no time curve assigned)")
+
+        self._twt_base = np.asarray(base, dtype=float)
+        self.twt = self._twt_base + float(self.bulk_shift)
+        self.notes = notes
+        return notes
+
+    # -- derived -----------------------------------------------------------
     @property
     def ai(self) -> np.ndarray:
         return utils.acoustic_impedance(self.vp, self.rho)
@@ -240,6 +346,96 @@ class WellData:
         r[good] = r_full[good]
         return r
 
+    def curve_inventory(self) -> list[dict[str, Any]]:
+        """Every curve in the LAS with its unit, description and statistics.
+
+        This is what makes the assignment step usable: you can see that
+        ``DTCO`` runs 55-140 and ``RHOZ`` runs 1.9-2.7 before deciding which is
+        which, instead of guessing from the mnemonic alone.
+        """
+        rows: list[dict[str, Any]] = []
+        roles = {
+            self.selection.sonic: "Vp (sonic)",
+            self.selection.density: "Density",
+            self.selection.time: "TWT",
+        }
+        for mnemonic, values in self.curves.items():
+            v = np.asarray(values, dtype=float)
+            good = np.isfinite(v)
+            rows.append({
+                "curve": mnemonic,
+                "role": roles.get(mnemonic, ""),
+                "LAS unit": self.curve_units.get(mnemonic, ""),
+                "description": (self.curve_descr.get(mnemonic, "") or "")[:60],
+                "valid %": round(100.0 * good.mean(), 1) if v.size else 0.0,
+                "min": round(float(np.nanmin(v)), 3) if good.any() else None,
+                "mean": round(float(np.nanmean(v)), 3) if good.any() else None,
+                "max": round(float(np.nanmax(v)), 3) if good.any() else None,
+            })
+        return rows
+
+    def qc_flags(self, seismic_twt: np.ndarray | None = None) -> list[tuple[str, str]]:
+        """Sanity checks on the assigned curves.
+
+        Returns ``(severity, message)`` pairs where severity is ``error``,
+        ``warning`` or ``ok``.  The ranges are wide on purpose: the job here is
+        to catch a unit mistake -- a factor of 3.28 or 1000 -- not to police
+        unusual rocks.
+        """
+        flags: list[tuple[str, str]] = []
+        good = self.valid_mask()
+
+        if not good.any():
+            flags.append(("error", "No depth sample has valid Vp, density and time together. "
+                                   "Check the curve assignment and units."))
+            return flags
+
+        vp, rho, ai = self.vp[good], self.rho[good], self.ai[good]
+
+        def _range_check(name, values, lo, hi, unit, hint):
+            med = float(np.nanmedian(values))
+            if not (lo <= med <= hi):
+                flags.append(("error", f"{name} median {med:,.0f} {unit} is outside the plausible "
+                                       f"range {lo:,.0f}-{hi:,.0f}. {hint}"))
+                return
+            out = float(np.mean((values < lo) | (values > hi)) * 100.0)
+            if out > 5.0:
+                flags.append(("warning", f"{out:.0f}% of {name} samples fall outside "
+                                         f"{lo:,.0f}-{hi:,.0f} {unit}."))
+            else:
+                flags.append(("ok", f"{name} median {med:,.0f} {unit} looks plausible."))
+
+        _range_check("Vp", vp, *VP_RANGE, "m/s",
+                     "A factor of ~3.28 means feet and metres are swapped; ~1000 means the unit is wrong.")
+        _range_check("Density", rho, *RHO_RANGE, "kg/m3",
+                     "A factor of 1000 means g/cm3 and kg/m3 are swapped.")
+        _range_check("AI", ai, *AI_RANGE, "m/s*kg/m3", "Check the Vp and density units above.")
+
+        valid_pct = 100.0 * good.mean()
+        if valid_pct < 50:
+            flags.append(("warning", f"Only {valid_pct:.0f}% of samples are usable "
+                                     "(nulls in Vp, density or time)."))
+
+        twt = self.twt[good]
+        if np.any(np.diff(twt) < 0):
+            flags.append(("error", "The time curve is not monotonically increasing with depth. "
+                                   "Check the TWT assignment and its unit."))
+
+        if seismic_twt is not None and len(seismic_twt):
+            t0, t1 = float(twt.min()), float(twt.max())
+            s0, s1 = float(np.min(seismic_twt)), float(np.max(seismic_twt))
+            overlap = max(0.0, min(t1, s1) - max(t0, s0))
+            if overlap <= 0:
+                flags.append(("error", f"The logged interval ({t0:.0f}-{t1:.0f} ms) does not overlap "
+                                       f"the seismic ({s0:.0f}-{s1:.0f} ms). Check the time curve unit "
+                                       "and whether it is one-way or two-way."))
+            elif overlap < 0.25 * (t1 - t0):
+                flags.append(("warning", f"Only {overlap:.0f} ms of the logged interval overlaps the "
+                                         "seismic; the wavelet gate will be short."))
+            else:
+                flags.append(("ok", f"{overlap:.0f} ms of log overlaps the seismic."))
+        return flags
+
     def summary(self) -> dict[str, Any]:
         t0, t1 = self.time_range()
         return {
@@ -272,12 +468,30 @@ def file_digest(data: bytes | str, extra: str = "") -> str:
     return h.hexdigest()
 
 
-def persist_upload(uploaded, suffix: str = ".sgy") -> str:
-    """Spill a Streamlit UploadedFile to disk; segyio needs a real path."""
-    raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+UPLOAD_CHUNK = 8 * 1024 * 1024
+
+
+def persist_upload(uploaded, suffix: str = ".sgy", chunk: int = UPLOAD_CHUNK) -> str:
+    """Spill an uploaded file to disk; segyio needs a real path.
+
+    Copied in chunks rather than via ``getvalue()``.  At the 1 GB upload limit
+    ``getvalue()`` would materialise a second full copy of the volume as a
+    bytes object on top of the one Streamlit already holds, doubling peak
+    memory for no reason.
+    """
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(raw)
-    tmp.close()
+    try:
+        if hasattr(uploaded, "seek"):
+            uploaded.seek(0)
+        while True:
+            block = uploaded.read(chunk)
+            if not block:
+                break
+            tmp.write(block)
+    finally:
+        tmp.close()
+        if hasattr(uploaded, "seek"):
+            uploaded.seek(0)
     return tmp.name
 
 
@@ -500,6 +714,20 @@ def _write_segy_from_template(volume: SeismicVolume, out_path: str, template_pat
 SONIC_ALIASES = ("DT", "DTC", "DTCO", "AC", "DT24", "DTP")
 DENSITY_ALIASES = ("RHOB", "RHOZ", "DEN", "DENS", "RHO")
 TIME_ALIASES = ("TWT", "TIME", "TWTT", "OWT")
+VELOCITY_ALIASES = ("VP", "VEL", "PVEL", "VELP")
+
+# Units the log-QC step offers per role.  The sonic list deliberately includes
+# velocity units: plenty of LAS files carry Vp directly rather than slowness,
+# and forcing the user to pretend it is slowness would corrupt the impedance.
+SONIC_UNITS = ("us/ft", "us/m", "m/s", "ft/s")
+DENSITY_UNITS = ("g/cm3", "kg/m3")
+TIME_UNITS = ("ms (TWT)", "s (TWT)", "ms (OWT)", "s (OWT)")
+
+# Plausible ranges used to flag suspect logs.  Deliberately wide -- these catch
+# a unit mistake (a factor of 3.28 or 1000), not an unusual rock.
+VP_RANGE = (1200.0, 7500.0)          # m/s
+RHO_RANGE = (1400.0, 3300.0)         # kg/m3
+AI_RANGE = (1.5e6, 2.3e7)            # m/s * kg/m3
 
 
 def _first_curve(las, aliases: Sequence[str]) -> tuple[str | None, np.ndarray | None]:
@@ -516,6 +744,121 @@ def _first_curve(las, aliases: Sequence[str]) -> tuple[str | None, np.ndarray | 
     return None, None
 
 
+def autodetect_selection(
+    curves: dict[str, np.ndarray],
+    units: dict[str, str],
+    constant_vp: float | None = None,
+    sonic_unit_hint: str | None = None,
+) -> CurveSelection:
+    """Guess which curve fills each role, and in what unit.
+
+    Mnemonic aliases pick the curve; the LAS unit string is trusted when it is
+    recognisable, and otherwise the *magnitude* decides -- a "density" running
+    around 2.4 is g/cm3, one around 2400 is kg/m3.  Every guess is overridable
+    on the log-QC step, which is the point: this only has to be a good default.
+    """
+    upper = {k.upper(): k for k in curves}
+
+    def match(aliases):
+        for alias in aliases:
+            if alias in upper:
+                return upper[alias]
+        for alias in aliases:
+            for u, original in upper.items():
+                if u.startswith(alias):
+                    return original
+        return None
+
+    sel = CurveSelection(constant_vp=constant_vp)
+
+    sonic = match(SONIC_ALIASES)
+    velocity = match(VELOCITY_ALIASES)
+    if sonic:
+        sel.sonic = sonic
+        sel.sonic_unit = _guess_sonic_unit(curves[sonic], units.get(sonic, ""), sonic_unit_hint)
+    elif velocity:
+        sel.sonic = velocity
+        sel.sonic_unit = _guess_velocity_unit(curves[velocity], units.get(velocity, ""))
+
+    density = match(DENSITY_ALIASES)
+    if density:
+        sel.density = density
+        sel.density_unit = _guess_density_unit(curves[density], units.get(density, ""))
+
+    time_curve = match(TIME_ALIASES)
+    if time_curve:
+        sel.time = time_curve
+        sel.time_unit = _guess_time_unit(curves[time_curve], units.get(time_curve, ""), time_curve)
+    return sel
+
+
+def _unit_text(unit: str) -> str:
+    return str(unit or "").strip().lower().replace(" ", "").replace("_", "/")
+
+
+def _guess_sonic_unit(values, unit: str, hint: str | None = None) -> str:
+    """Resolve a sonic curve's unit: LAS unit string first, then magnitude.
+
+    The hint (the app-wide default) is consulted *last*, and only where the
+    magnitude is genuinely ambiguous.  Letting it win earlier would make the
+    other evidence useless -- the hint is always a valid unit, so it would
+    short-circuit every case.
+
+    Typical magnitudes: us/ft 40-200, us/m 130-650, m/s 1200-7500,
+    ft/s 4000-25000.  Only the 130-200 band is truly ambiguous.
+    """
+    u = _unit_text(unit)
+    if "us/m" in u or "usec/m" in u:
+        return "us/m"
+    if "us/f" in u or "usec/f" in u:
+        return "us/ft"
+    if "ft/s" in u:
+        return "ft/s"
+    if "m/s" in u:
+        return "m/s"
+
+    med = float(np.nanmedian(np.asarray(values, dtype=float)))
+    if not np.isfinite(med) or med <= 0:
+        return hint if hint in SONIC_UNITS else "us/ft"
+    if med > 900:                       # velocity, not slowness
+        return "ft/s" if med > 8000 else "m/s"
+    if med > 250:
+        return "us/m"
+    if med < 130:
+        return "us/ft"
+    # 130-250 overlaps us/ft and us/m; this is where the hint earns its keep.
+    return hint if hint in ("us/ft", "us/m") else "us/ft"
+
+
+def _guess_velocity_unit(values, unit: str) -> str:
+    u = _unit_text(unit)
+    if "ft" in u:
+        return "ft/s"
+    if "m/s" in u:
+        return "m/s"
+    med = float(np.nanmedian(np.asarray(values, dtype=float)))
+    return "ft/s" if np.isfinite(med) and med > 8000 else "m/s"
+
+
+def _guess_density_unit(values, unit: str) -> str:
+    u = _unit_text(unit)
+    if "kg" in u:
+        return "kg/m3"
+    if "g/c" in u:
+        return "g/cm3"
+    med = float(np.nanmedian(np.asarray(values, dtype=float)))
+    return "kg/m3" if np.isfinite(med) and med > 100 else "g/cm3"
+
+
+def _guess_time_unit(values, unit: str, mnemonic: str) -> str:
+    one_way = mnemonic.upper().startswith("OWT")
+    med = float(np.nanmedian(np.abs(np.asarray(values, dtype=float))))
+    seconds = "s" == _unit_text(unit) or (np.isfinite(med) and med < 20)
+    if one_way:
+        return "s (OWT)" if seconds else "ms (OWT)"
+    return "s (TWT)" if seconds else "ms (TWT)"
+
+
 def load_las(
     path_or_buffer,
     name: str | None = None,
@@ -527,10 +870,14 @@ def load_las(
 ) -> WellData:
     """Parse a LAS file into a :class:`WellData`.
 
-    Requires a density curve plus either a sonic curve or ``constant_vp``.
-    The time axis is taken from a TWT curve when the LAS carries one (wells are
-    assumed tied upstream); otherwise it is built by integrating the sonic from
-    the datum, with ``replacement_velocity`` bridging KB to the seismic datum.
+    Every curve in the file is kept, along with its unit and description, and
+    the roles (Vp / density / TWT) are auto-detected into a
+    :class:`CurveSelection`.  Nothing is discarded on the basis of that guess:
+    the log-QC step can reassign any role to any curve and change its unit
+    without re-reading the file.
+
+    Raises only when the file yields no curves at all -- a missing density is a
+    QC flag to be resolved in the UI, not a hard failure that loses the well.
     """
     import lasio
 
@@ -541,69 +888,43 @@ def load_las(
     else:
         las = lasio.read(path_or_buffer)
 
-    notes: list[str] = []
     md = np.asarray(las.index, dtype=float)
+    curves: dict[str, np.ndarray] = {}
+    units: dict[str, str] = {}
+    descr: dict[str, str] = {}
+    for curve in las.curves:
+        curves[curve.mnemonic] = np.asarray(las[curve.mnemonic], dtype=float)
+        units[curve.mnemonic] = str(getattr(curve, "unit", "") or "")
+        descr[curve.mnemonic] = str(getattr(curve, "descr", "") or "")
 
-    sonic_name, dt_curve = _first_curve(las, SONIC_ALIASES)
-    rho_name, rhob = _first_curve(las, DENSITY_ALIASES)
+    if not curves:
+        raise ValueError(f"{name or 'LAS'}: file contains no curves")
 
-    if rhob is None:
-        raise ValueError(
-            f"{name or 'LAS'}: no density curve found (looked for {', '.join(DENSITY_ALIASES)})"
-        )
+    well_name = (name or _header_value(las, ("WELL",), "") or "WELL")
+    well = WellData(
+        name=str(well_name).strip(),
+        md=md,
+        twt=np.full(md.shape, np.nan),
+        vp=np.full(md.shape, np.nan),
+        rho=np.full(md.shape, np.nan),
+        x=_as_float(_header_value(las, ("XCOORD", "X", "SURFX", "EASTING", "LOCX"), None)),
+        y=_as_float(_header_value(las, ("YCOORD", "Y", "SURFY", "NORTHING", "LOCY"), None)),
+        kb=float(_as_float(_header_value(las, ("KB", "EKB", "ELEV"), 0.0)) or 0.0),
+        uwi=str(_header_value(las, ("UWI", "API", "WELL"), "") or ""),
+        curves=curves,
+        curve_units=units,
+        curve_descr=descr,
+    )
 
-    if dt_curve is not None:
-        vp = utils.sonic_to_velocity(dt_curve, unit=sonic_unit)
-        notes.append(f"Vp from sonic curve '{sonic_name}' ({sonic_unit})")
-    elif constant_vp is not None:
-        vp = np.full(md.shape, float(constant_vp))
-        notes.append(f"No sonic curve; using constant Vp = {constant_vp:.0f} m/s")
-    else:
-        raise ValueError(
-            f"{name or 'LAS'}: no sonic curve found and no constant Vp supplied "
-            f"(looked for {', '.join(SONIC_ALIASES)})"
-        )
-
-    # Density: LAS is usually g/cm3; anything above 100 is already kg/m3.
-    rho = np.asarray(rhob, dtype=float)
-    if np.nanmedian(rho) < 100:
-        rho = utils.density_to_si(rho, "g/cm3")
-        notes.append("Density converted g/cm3 -> kg/m3")
-
-    time_name, twt_curve = _first_curve(las, TIME_ALIASES)
-    if twt_curve is not None and np.isfinite(twt_curve).sum() > 2:
-        twt = np.asarray(twt_curve, dtype=float)
-        if time_name and time_name.upper() == "OWT":
-            twt = twt * 2.0
-            notes.append("OWT curve doubled to TWT")
-        if np.nanmax(twt) < 20:  # seconds, not milliseconds
-            twt = twt * 1000.0
-            notes.append("Time curve scaled s -> ms")
-        notes.append(f"TWT taken from curve '{time_name}' (well assumed already tied)")
-    else:
-        twt = integrate_sonic_to_twt(
-            md, vp, kb=_header_value(las, ("KB", "EKB", "ELEV"), 0.0),
-            replacement_velocity=replacement_velocity, seismic_datum=seismic_datum,
-        )
-        notes.append("TWT integrated from sonic (no time curve in LAS)")
+    selection = autodetect_selection(curves, units, constant_vp=constant_vp,
+                                     sonic_unit_hint=sonic_unit)
+    well.apply_selection(selection, replacement_velocity=replacement_velocity,
+                         seismic_datum=seismic_datum)
 
     if datum_twt:
-        twt = twt + float(datum_twt)
-        notes.append(f"Bulk shift {datum_twt:+.1f} ms applied")
-
-    well_name = (name or _header_value(las, ("WELL",), "") or "WELL").strip()
-    uwi = str(_header_value(las, ("UWI", "API", "WELL"), "") or "")
-    x = _header_value(las, ("XCOORD", "X", "SURFX", "EASTING", "LOCX"), None)
-    y = _header_value(las, ("YCOORD", "Y", "SURFY", "NORTHING", "LOCY"), None)
-    kb = _header_value(las, ("KB", "EKB", "ELEV"), 0.0)
-
-    curves = {c.mnemonic: np.asarray(las[c.mnemonic], dtype=float) for c in las.curves}
-
-    return WellData(
-        name=well_name, md=md, twt=twt, vp=vp, rho=rho,
-        x=_as_float(x), y=_as_float(y), kb=float(_as_float(kb) or 0.0),
-        uwi=uwi, curves=curves, notes=notes,
-    )
+        well.set_bulk_shift(float(datum_twt))
+        well.notes.append(f"Bulk shift {datum_twt:+.1f} ms applied")
+    return well
 
 
 def _header_value(las, keys: Sequence[str], default):
@@ -884,15 +1205,33 @@ def make_synthetic_dataset(
         rho_f = np.interp(fine_twt, twt, rho_c) * (1 + rng.normal(0, 0.004, fine_twt.size))
         md = np.cumsum(np.gradient(fine_twt) / 1000.0 / 2.0 * vp_f)
 
-        wells.append(
-            WellData(
-                name=f"SYN-{k + 1}",
-                md=md, twt=fine_twt, vp=vp_f, rho=rho_f,
-                x=float(cdp_x[i, j]), y=float(cdp_y[i, j]),
-                kb=30.0, uwi=f"SYNTHETIC-{k + 1:03d}",
-                notes=["synthetic well sampled from the true impedance model"],
-            )
+        # Carry the same curve/unit machinery as a loaded LAS: sonic in us/ft,
+        # density in g/cm3, an explicit TWT curve.  Without this the synthetic
+        # wells would be a special case that the log-QC step cannot describe --
+        # and "apply assignment" there would wipe logs it could not see.
+        curves = {
+            "DEPT": md,
+            "DT": 1.0e6 / (vp_f * utils.FT_PER_M),
+            "RHOB": rho_f / 1000.0,
+            "TWT": fine_twt,
+        }
+        well = WellData(
+            name=f"SYN-{k + 1}",
+            md=md, twt=fine_twt, vp=vp_f, rho=rho_f,
+            x=float(cdp_x[i, j]), y=float(cdp_y[i, j]),
+            kb=30.0, uwi=f"SYNTHETIC-{k + 1:03d}",
+            curves=curves,
+            curve_units={"DEPT": "m", "DT": "us/ft", "RHOB": "g/cm3", "TWT": "ms"},
+            curve_descr={"DEPT": "Measured depth", "DT": "Sonic slowness",
+                         "RHOB": "Bulk density", "TWT": "Two-way time (already tied)"},
         )
+        well.apply_selection(CurveSelection(
+            sonic="DT", sonic_unit="us/ft",
+            density="RHOB", density_unit="g/cm3",
+            time="TWT", time_unit="ms (TWT)",
+        ))
+        well.notes.insert(0, "synthetic well sampled from the true impedance model")
+        wells.append(well)
 
     return volume, wells
 

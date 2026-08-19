@@ -527,6 +527,80 @@ def well_log_figure(well, twt_axis: np.ndarray | None = None, height: int = 620)
     return fig
 
 
+def log_qc_figure(well, vp_range=None, rho_range=None, height: int = 620) -> go.Figure:
+    """Assigned Vp / density / AI against depth, with out-of-range samples marked.
+
+    Colouring the implausible samples red is the fastest way to see a unit
+    mistake: a wrongly-assigned unit turns a whole track red at once, whereas a
+    bad hole section shows up as isolated patches.
+    """
+    from .data_io import AI_RANGE, RHO_RANGE, VP_RANGE
+
+    vp_range = vp_range or VP_RANGE
+    rho_range = rho_range or RHO_RANGE
+
+    fig = make_subplots(rows=1, cols=3, shared_yaxes=True, horizontal_spacing=0.05,
+                        subplot_titles=("Vp (m/s)", "Density (kg/m3)", "AI"))
+    md = np.asarray(well.md, dtype=float)
+
+    tracks = [
+        (well.vp, vp_range, "#4f81bd", 1),
+        (well.rho, rho_range, "#9bbb59", 2),
+        (well.ai, AI_RANGE, "#8064a2", 3),
+    ]
+    for values, (lo, hi), colour, col in tracks:
+        v = np.asarray(values, dtype=float)
+        good = np.isfinite(v)
+        fig.add_trace(go.Scatter(x=v[good], y=md[good], mode="lines",
+                                 line=dict(color=colour, width=1), showlegend=False), row=1, col=col)
+        bad = good & ((v < lo) | (v > hi))
+        if bad.any():
+            fig.add_trace(go.Scatter(x=v[bad], y=md[bad], mode="markers",
+                                     marker=dict(color="#c0504d", size=3),
+                                     name="outside plausible range",
+                                     showlegend=(col == 1)), row=1, col=col)
+        for edge in (lo, hi):
+            fig.add_vline(x=edge, line=dict(color="grey", width=1, dash="dot"), row=1, col=col)
+
+    fig.update_yaxes(autorange="reversed", title_text="MD (m)", row=1, col=1)
+    for col in (2, 3):
+        fig.update_yaxes(autorange="reversed", row=1, col=col)
+    fig.update_layout(template=_TEMPLATE, height=height,
+                      title=f"{well.name} - assigned curves &nbsp;|&nbsp; {well.selection.describe()}",
+                      legend=dict(orientation="h", y=-0.08),
+                      margin=dict(l=60, r=20, t=70, b=55))
+    return fig
+
+
+def curve_preview_figure(well, mnemonics, height: int = 560) -> go.Figure:
+    """Raw LAS curves as they sit in the file, one track each.
+
+    Deliberately unconverted -- this is for deciding *what a curve is*, so it
+    has to show the numbers the file actually contains.
+    """
+    mnemonics = [m for m in mnemonics if m in well.curves][:6]
+    if not mnemonics:
+        return go.Figure().update_layout(template=_TEMPLATE, height=200,
+                                         title="Select one or more curves to preview")
+
+    md = np.asarray(well.md, dtype=float)
+    titles = [f"{m} [{well.curve_units.get(m, '') or '-'}]" for m in mnemonics]
+    fig = make_subplots(rows=1, cols=len(mnemonics), shared_yaxes=True,
+                        horizontal_spacing=0.04, subplot_titles=titles)
+    palette = ["#4f81bd", "#9bbb59", "#8064a2", "#c0504d", "#4bacc6", "#f79646"]
+    for k, mnemonic in enumerate(mnemonics, start=1):
+        v = np.asarray(well.curves[mnemonic], dtype=float)
+        good = np.isfinite(v)
+        fig.add_trace(go.Scatter(x=v[good], y=md[good], mode="lines",
+                                 line=dict(color=palette[(k - 1) % len(palette)], width=1),
+                                 showlegend=False), row=1, col=k)
+        fig.update_yaxes(autorange="reversed", row=1, col=k)
+    fig.update_yaxes(title_text="MD (m)", row=1, col=1)
+    fig.update_layout(template=_TEMPLATE, height=height, title=f"{well.name} - raw curves",
+                      margin=dict(l=60, r=20, t=70, b=45))
+    return fig
+
+
 def low_freq_qc_figure(model, ties: Sequence, height: int = 560) -> go.Figure:
     """Background model against the well AI it was built from, per well."""
     n = max(len(ties), 1)

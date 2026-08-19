@@ -20,6 +20,17 @@ streamlit run app.py
 
 Python 3.10 or newer is required (the code uses `X | None` annotations).
 
+### Large volumes
+
+Browser upload is capped at **1 GB** (set in `.streamlit/config.toml`; raise
+`maxUploadSize` if you need more). Uploads are streamed to disk in chunks
+rather than buffered whole, so peak memory is not doubled.
+
+For volumes at the top of that range, step 1 also accepts a **path on the
+machine running the app**, which skips the upload entirely — no size limit and
+nothing held in memory twice. Note that the loaded cube still has to fit in
+RAM: budget roughly the SEG-Y's own size again for the float32 array.
+
 The app opens on **step 1 - Data**. The fastest way to see it work is to pick
 **Synthetic demo dataset** and press *Generate*, then walk down the sidebar:
 wavelet → low-frequency model → inversion → results. No data of your own is
@@ -59,11 +70,12 @@ background model fails.
 | Step | What it does |
 | --- | --- |
 | **1 - Data** | SEG-Y + byte positions (with a header scan to identify non-standard ones), multi-well LAS, optional well-header and horizon CSVs. Or generate a synthetic dataset. |
-| **2 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
-| **3 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
-| **4 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
-| **5 - Inversion** | Method selection, method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
-| **6 - Results & export** | Section viewer, time slice, per-trace QC maps, crossplot against well logs, export. |
+| **2 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks. |
+| **3 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
+| **4 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
+| **5 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
+| **6 - Inversion** | Method selection, method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
+| **7 - Results & export** | Section viewer, time slice, per-trace QC maps, crossplot against well logs, export. |
 
 Everything is held in `st.session_state`, so moving between steps never reloads
 data. Changing something upstream (a bulk shift, the wells, the volume) clears
@@ -200,6 +212,52 @@ app says so.
 
 The same reasoning applies to the coloured operator, which gets its own scalar
 fitted against the band-limited well log-impedance.
+
+---
+
+## Log QC and curve assignment
+
+LAS files are not consistent. Mnemonics vary (`DT`, `DTC`, `DTCO`, `AC`, or
+something a vendor invented), unit strings are often blank or wrong, and some
+files carry velocity where you expect slowness. A sonic read as `us/m` when it
+is really `us/ft` scales Vp by 3.28; a density read as `g/cm3` when it is
+`kg/m3` is out by 1000. Either mistake produces impedance that is confidently,
+silently wrong.
+
+**Step 2** exists to catch that before it propagates:
+
+- **Curve inventory** — every curve in the file with its LAS unit, description,
+  valid percentage and min/mean/max. You can see that `DTCO` runs 55–140 and
+  `RHOZ` runs 1.9–2.7 before deciding which is which.
+- **Assignment** — pick which curve fills each role (Vp, density, TWT) and its
+  unit, per well or applied across all wells at once. Well names are editable
+  here too, since LAS headers are frequently blank or inconsistent.
+- **Sanity checks** — Vp, density and AI are range-checked, the time curve is
+  checked for monotonicity, and the logged interval is checked against the
+  seismic time range. Ranges are wide on purpose: the job is to catch a unit
+  mistake, not to police unusual rocks.
+- **Displays** — raw curves exactly as stored (for deciding what a curve *is*),
+  and the converted Vp / density / AI tracks with out-of-range samples in red.
+
+Units offered per role:
+
+| Role | Units |
+| --- | --- |
+| Vp / sonic | `us/ft`, `us/m`, `m/s`, `ft/s` |
+| Density | `g/cm3`, `kg/m3` |
+| Time | `ms (TWT)`, `s (TWT)`, `ms (OWT)`, `s (OWT)` |
+
+`m/s` and `ft/s` are there because plenty of files carry Vp directly rather
+than slowness. OWT curves are doubled to two-way time on load.
+
+Auto-detection on load resolves the roles and units in that order of evidence:
+the **LAS unit string** first, then the curve's **magnitude** (the ranges
+barely overlap), and only for the genuinely ambiguous 130–250 band does the
+app-wide hint on step 1 break the tie. Everything is overridable — the guess
+only has to be a good default.
+
+A well missing a density curve still loads, and shows up as a failed check to
+resolve here, rather than being rejected at the door and lost.
 
 ---
 

@@ -28,11 +28,12 @@ st.set_page_config(page_title="Post-Stack Seismic Inversion", page_icon="~", lay
 
 STEPS = [
     "1 - Data",
-    "2 - Well tie QC",
-    "3 - Wavelet",
-    "4 - Low-frequency model",
-    "5 - Inversion",
-    "6 - Results & export",
+    "2 - Log QC",
+    "3 - Well tie QC",
+    "4 - Wavelet",
+    "5 - Low-frequency model",
+    "6 - Inversion",
+    "7 - Results & export",
 ]
 
 DEFAULTS = {
@@ -288,7 +289,23 @@ def _synthetic_loader() -> None:
 
 def _segy_loader() -> None:
     st.subheader("SEG-Y volume")
-    uploaded = st.file_uploader("3D post-stack SEG-Y", type=["sgy", "segy", "SGY", "SEGY"])
+
+    mode = st.radio(
+        "Source", ["Upload a file", "Path on this machine"], horizontal=True,
+        help="Browser upload is capped at 1 GB and holds the file in memory while it "
+             "transfers. For large volumes, pointing at a path on the machine running "
+             "the app skips both.")
+
+    uploaded = None
+    local_path = ""
+    if mode == "Upload a file":
+        uploaded = st.file_uploader("3D post-stack SEG-Y (up to 1 GB)",
+                                    type=["sgy", "segy", "SGY", "SEGY"])
+    else:
+        local_path = st.text_input(
+            "Full path to the SEG-Y file",
+            placeholder=r"C:\data\survey\poststack.sgy",
+            help="Read directly from disk - no size limit and nothing held in memory twice.")
 
     st.markdown("**Trace header byte positions**")
     c1, c2, c3, c4 = st.columns(4)
@@ -298,13 +315,22 @@ def _segy_loader() -> None:
                           help="0 to skip; a bin grid is synthesised instead.")
     b_y = c4.number_input("CDP Y", 0, 240, data_io.DEFAULT_BYTES["cdp_y"], 1)
 
-    if uploaded is None:
-        return
-
-    if st.session_state.get("_upload_name") != uploaded.name:
-        st.session_state._upload_path = data_io.persist_upload(uploaded)
-        st.session_state._upload_name = uploaded.name
-    path = st.session_state._upload_path
+    if mode == "Path on this machine":
+        if not local_path:
+            return
+        if not os.path.isfile(local_path):
+            st.error(f"No file at `{local_path}`. Check the path and that the app can reach it.")
+            return
+        path = local_path
+        st.caption(f"{os.path.getsize(path) / 1e6:,.0f} MB on disk")
+    else:
+        if uploaded is None:
+            return
+        if st.session_state.get("_upload_name") != uploaded.name:
+            with st.spinner("Writing the upload to disk..."):
+                st.session_state._upload_path = data_io.persist_upload(uploaded)
+            st.session_state._upload_name = uploaded.name
+        path = st.session_state._upload_path
 
     with st.expander("Scan trace headers (helps identify non-standard byte positions)"):
         if st.button("Run header scan"):
@@ -334,10 +360,17 @@ def _las_loader() -> None:
     st.subheader("Well logs (LAS)")
     files = st.file_uploader("One or more LAS files", type=["las", "LAS"], accept_multiple_files=True)
 
+    st.caption(
+        "Curve roles and units are detected automatically on load and can be corrected on "
+        "**step 2 - Log QC**, so a well with unusual mnemonics still loads here.")
+
     c1, c2, c3 = st.columns(3)
-    sonic_unit = c1.selectbox("Sonic unit", ["us/ft", "us/m"])
+    sonic_unit = c1.selectbox(
+        "Sonic unit hint", data_io.SONIC_UNITS,
+        help="Only consulted where the LAS unit is blank and the magnitude is ambiguous "
+             "(slowness near 130-250). Correct any well individually on step 2.")
     const_vp = c2.number_input("Fallback Vp (m/s) if no sonic", 0.0, 8000.0, 0.0, 100.0,
-                               help="0 disables the fallback; a well with no sonic then fails to load.")
+                               help="0 disables the fallback.")
     repl_v = c3.number_input("Replacement velocity (m/s)", 500.0, 6000.0, 2500.0, 100.0,
                              help="Used only when the LAS has no time curve, to bridge KB to the datum.")
 
@@ -359,7 +392,9 @@ def _las_loader() -> None:
         if errors:
             st.error("Some files could not be loaded:\n\n" + "\n\n".join(errors))
         elif wells:
-            flash(f"Loaded {len(wells)} wells.")
+            flagged = sum(1 for w in wells if any(sev == "error" for sev, _ in w.qc_flags()))
+            note = f" {flagged} need attention on step 2 - Log QC." if flagged else ""
+            flash(f"Loaded {len(wells)} wells.{note}")
 
 
 def _optional_files() -> None:
@@ -395,11 +430,203 @@ def _optional_files() -> None:
 
 
 # ==========================================================================
-# Step 2 -- Well tie QC
+# Step 2 -- Log QC and curve assignment
+# ==========================================================================
+
+def page_log_qc() -> None:
+    st.header("2 - Log QC")
+    wells = st.session_state.wells
+    vol = st.session_state.volume
+    if not wells:
+        st.info("Load some wells on step 1 first.")
+        return
+
+    st.caption(
+        "Check what was actually read from each LAS, and correct it. Curve roles and units "
+        "are auto-detected on load, but mnemonics and unit strings vary enough between vendors "
+        "that the guess is only a starting point -- a wrong sonic unit scales Vp by 3.28 or "
+        "1000 and quietly ruins every impedance downstream."
+    )
+
+    names = [w.name for w in wells]
+    pick = st.selectbox("Well", names, key="logqc_well")
+    well = next(w for w in wells if w.name == pick)
+
+    _log_qc_flags(well, vol)
+
+    st.divider()
+    st.subheader("Curve assignment")
+    st.caption(f"Currently: {well.selection.describe()}")
+    _curve_assignment_form(well, vol)
+
+    st.divider()
+    st.subheader("Curves in this file")
+    inventory = pd.DataFrame(well.curve_inventory())
+    st.dataframe(inventory, hide_index=True, width="stretch")
+
+    preview = st.multiselect(
+        "Preview raw curves", list(well.curves), max_selections=6,
+        default=[c for c in (well.selection.sonic, well.selection.density) if c],
+        help="Shown exactly as stored in the file, before any unit conversion.")
+    if preview:
+        st.plotly_chart(viz.curve_preview_figure(well, preview), width="stretch")
+
+    st.divider()
+    st.subheader("Converted logs")
+    st.plotly_chart(viz.log_qc_figure(well), width="stretch")
+
+    st.divider()
+    st.subheader("All wells")
+    st.dataframe(pd.DataFrame([{
+        "well": w.name,
+        "Vp curve": w.selection.sonic or (f"constant {w.selection.constant_vp:.0f}"
+                                          if w.selection.constant_vp else "-"),
+        "Vp unit": w.selection.sonic_unit if w.selection.sonic else "-",
+        "density curve": w.selection.density or "-",
+        "density unit": w.selection.density_unit if w.selection.density else "-",
+        "time curve": w.selection.time or "integrated",
+        "time unit": w.selection.time_unit if w.selection.time else "-",
+        "usable samples": int(w.valid_mask().sum()),
+        "issues": sum(1 for sev, _ in w.qc_flags(vol.twt if vol else None) if sev != "ok"),
+    } for w in wells]), hide_index=True, width="stretch")
+
+
+def _log_qc_flags(well, vol) -> None:
+    """Render the pass/warn/fail checks for one well."""
+    flags = well.qc_flags(vol.twt if vol is not None else None)
+    errors = [m for sev, m in flags if sev == "error"]
+    warnings = [m for sev, m in flags if sev == "warning"]
+    passes = [m for sev, m in flags if sev == "ok"]
+
+    cols = st.columns(3)
+    cols[0].metric("Failed checks", len(errors))
+    cols[1].metric("Warnings", len(warnings))
+    cols[2].metric("Passed", len(passes))
+
+    for message in errors:
+        st.error(message)
+    for message in warnings:
+        st.warning(message)
+    if passes and not errors:
+        with st.expander(f"{len(passes)} checks passed"):
+            for message in passes:
+                st.markdown(f"- {message}")
+
+
+def _curve_assignment_form(well, vol) -> None:
+    """Editor for the well name and the curve/unit assignment."""
+    if not well.curves:
+        st.warning(
+            f"**{well.name}** carries no named curves, so there is nothing to reassign. "
+            "Its Vp and density were supplied directly rather than read from a LAS.")
+        return
+
+    options = ["(none)"] + list(well.curves)
+
+    def index_of(mnemonic):
+        return options.index(mnemonic) if mnemonic in options else 0
+
+    with st.form(f"assign_{well.name}"):
+        new_name = st.text_input(
+            "Well name", value=well.name,
+            help="LAS headers often carry a blank or inconsistent well name. "
+                 "This name is what appears on sections, tables and the base map.")
+
+        c1, c2 = st.columns(2)
+        sonic = c1.selectbox("Vp / sonic curve", options, index=index_of(well.selection.sonic))
+        sonic_unit = c2.selectbox(
+            "Vp unit", data_io.SONIC_UNITS,
+            index=data_io.SONIC_UNITS.index(well.selection.sonic_unit)
+            if well.selection.sonic_unit in data_io.SONIC_UNITS else 0,
+            help="us/ft and us/m are slowness; m/s and ft/s are for a curve that already holds "
+                 "velocity rather than sonic travel time.")
+
+        c3, c4 = st.columns(2)
+        density = c3.selectbox("Density curve", options, index=index_of(well.selection.density))
+        density_unit = c4.selectbox(
+            "Density unit", data_io.DENSITY_UNITS,
+            index=data_io.DENSITY_UNITS.index(well.selection.density_unit)
+            if well.selection.density_unit in data_io.DENSITY_UNITS else 0)
+
+        c5, c6 = st.columns(2)
+        time_curve = c5.selectbox(
+            "Time curve", options, index=index_of(well.selection.time),
+            help="Leave as (none) to integrate the sonic instead. Wells are assumed tied "
+                 "upstream, so a TWT curve in the LAS is preferred where one exists.")
+        time_unit = c6.selectbox(
+            "Time unit", data_io.TIME_UNITS,
+            index=data_io.TIME_UNITS.index(well.selection.time_unit)
+            if well.selection.time_unit in data_io.TIME_UNITS else 0,
+            help="OWT is doubled to two-way time on load.")
+
+        c7, c8 = st.columns(2)
+        constant_vp = c7.number_input(
+            "Fallback constant Vp (m/s)", 0.0, 8000.0,
+            float(well.selection.constant_vp or 0.0), 100.0,
+            help="Used only when no Vp curve is assigned. 0 disables it.")
+        repl_v = c8.number_input(
+            "Replacement velocity (m/s)", 500.0, 6000.0, 2500.0, 100.0,
+            help="Bridges KB to the seismic datum when the time axis is integrated from sonic.")
+
+        apply_all = st.checkbox(
+            "Apply this assignment to every well",
+            help="Only affects wells that actually contain the named curves.")
+        submitted = st.form_submit_button("Apply assignment", type="primary")
+
+    if not submitted:
+        return
+
+    selection = data_io.CurveSelection(
+        sonic=None if sonic == "(none)" else sonic,
+        sonic_unit=sonic_unit,
+        density=None if density == "(none)" else density,
+        density_unit=density_unit,
+        time=None if time_curve == "(none)" else time_curve,
+        time_unit=time_unit,
+        constant_vp=constant_vp if constant_vp > 0 else None,
+    )
+
+    if (selection.sonic is None and not selection.constant_vp) or selection.density is None:
+        st.error(
+            "Assign both a Vp source (a curve, or a constant) and a density curve before "
+            "applying -- otherwise this would clear the logs this well already has.")
+        return
+
+    targets = st.session_state.wells if apply_all else [well]
+    applied, skipped = [], []
+    for target in targets:
+        if target is well and new_name.strip() and new_name.strip() != well.name:
+            well.name = new_name.strip()
+        # Only push a role onto another well if it really has that curve.
+        local = data_io.CurveSelection(
+            sonic=selection.sonic if selection.sonic in target.curves else (
+                None if apply_all and target is not well else selection.sonic),
+            sonic_unit=selection.sonic_unit,
+            density=selection.density if selection.density in target.curves else (
+                None if apply_all and target is not well else selection.density),
+            density_unit=selection.density_unit,
+            time=selection.time if selection.time in target.curves else (
+                None if apply_all and target is not well else selection.time),
+            time_unit=selection.time_unit,
+            constant_vp=selection.constant_vp,
+        )
+        target.apply_selection(local, replacement_velocity=repl_v)
+        (applied if target.valid_mask().any() else skipped).append(target.name)
+
+    rebuild_ties("curve assignment changed")
+    invalidate("wavelet", "colour_operator", "lfm", "result")
+    message = f"Assignment applied to {', '.join(applied)}." if applied else "Assignment applied."
+    if skipped:
+        message += f" No usable samples for: {', '.join(skipped)}."
+    flash(message)
+
+
+# ==========================================================================
+# Step 3 -- Well tie QC
 # ==========================================================================
 
 def page_well_tie() -> None:
-    st.header("2 - Well tie QC")
+    st.header("3 - Well tie QC")
     vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
     if vol is None or not wells:
         st.info("Load a volume and at least one well first.")
@@ -428,7 +655,7 @@ def page_well_tie() -> None:
     qc_wavelet = st.session_state.wavelet
     if qc_wavelet is None:
         with c2:
-            st.info("No wavelet yet - QC uses a provisional Ricker. Build a wavelet on step 3 "
+            st.info("No wavelet yet - QC uses a provisional Ricker. Build a wavelet on step 4 "
                     "and return here to see the real fit.")
         freq = st.slider("Provisional Ricker frequency (Hz)", 5, 80, 25)
         qc_samples = wvl.ricker(freq, 128.0, vol.dt)
@@ -477,11 +704,11 @@ def page_well_tie() -> None:
 
 
 # ==========================================================================
-# Step 3 -- Wavelet
+# Step 4 -- Wavelet
 # ==========================================================================
 
 def page_wavelet() -> None:
-    st.header("3 - Wavelet")
+    st.header("4 - Wavelet")
     vol, ties = st.session_state.volume, st.session_state.ties
     if vol is None:
         st.info("Load a volume first.")
@@ -595,11 +822,11 @@ def page_wavelet() -> None:
 
 
 # ==========================================================================
-# Step 4 -- Low-frequency model
+# Step 5 -- Low-frequency model
 # ==========================================================================
 
 def page_low_freq() -> None:
-    st.header("4 - Low-frequency model")
+    st.header("5 - Low-frequency model")
     vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
     if vol is None or not wells:
         st.info("Load a volume and wells first.")
@@ -694,7 +921,7 @@ def _section_controls(vol, key: str, default_orientation: str = "inline"):
 
 
 # ==========================================================================
-# Step 5 -- Inversion
+# Step 6 -- Inversion
 # ==========================================================================
 
 class BackgroundJob:
@@ -729,7 +956,7 @@ class BackgroundJob:
 
 
 def page_inversion() -> None:
-    st.header("5 - Inversion")
+    st.header("6 - Inversion")
     vol, ties, wav, model = (st.session_state.volume, st.session_state.ties,
                              st.session_state.wavelet, st.session_state.lfm)
     if vol is None:
@@ -759,7 +986,7 @@ def page_inversion() -> None:
         params["merge_freq"] = c3.slider("Merge frequency (Hz)", 2.0, 25.0, 10.0, 0.5,
                                          help="Where the inverted band is spliced onto the model.")
         if wav is None:
-            ready, blockers = False, blockers + ["a wavelet (step 3)"]
+            ready, blockers = False, blockers + ["a wavelet (step 4)"]
         if model is None:
             st.info("Without a low-frequency model the output is relative impedance only.")
     else:
@@ -773,9 +1000,9 @@ def page_inversion() -> None:
                                          help="Hard bound per sample; 0.35 is roughly +/-42% in impedance.")
         params["merge_freq"] = c5.slider("Merge frequency (Hz)", 2.0, 25.0, 10.0, 0.5)
         if wav is None:
-            ready, blockers = False, blockers + ["a wavelet (step 3)"]
+            ready, blockers = False, blockers + ["a wavelet (step 4)"]
         if model is None:
-            ready, blockers = False, blockers + ["a low-frequency model (step 4)"]
+            ready, blockers = False, blockers + ["a low-frequency model (step 5)"]
 
     if not ready:
         st.warning("This method still needs: " + ", ".join(blockers) + ".")
@@ -868,7 +1095,7 @@ def _run_inline(vol, method, wav_samples, model, params, il_range, xl_range, lab
         st.session_state.result = result
         log(f"{label} {method}: {result.summary()['traces inverted']} traces in {result.elapsed_s:.1f}s")
         flash(f"{label.capitalize()} complete in {result.elapsed_s:.1f} s. "
-              "See step 6 for sections, crossplot and export.")
+              "See step 7 for sections, crossplot and export.")
     except Exception as exc:  # noqa: BLE001
         bar.empty()
         show_error(exc, f"{label.capitalize()} failed")
@@ -898,7 +1125,7 @@ def _poll_job() -> None:
     st.session_state.result = result
     log(f"full volume complete in {result.elapsed_s:.1f}s")
     flash(f"Full volume complete in {result.elapsed_s:.1f} s. "
-          "See step 6 for sections, crossplot and export.")
+          "See step 7 for sections, crossplot and export.")
 
 
 def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -> None:
@@ -941,15 +1168,15 @@ def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -
 
 
 # ==========================================================================
-# Step 6 -- Results and export
+# Step 7 -- Results and export
 # ==========================================================================
 
 def page_results() -> None:
-    st.header("6 - Results & export")
+    st.header("7 - Results & export")
     vol, ties, result, model = (st.session_state.volume, st.session_state.ties,
                                 st.session_state.result, st.session_state.lfm)
     if vol is None or result is None:
-        st.info("Run an inversion on step 5 first.")
+        st.info("Run an inversion on step 6 first.")
         return
 
     st.dataframe(pd.DataFrame([result.summary()]).T.rename(columns={0: "value"}),
@@ -1055,7 +1282,7 @@ def _crossplot_section(vol, ties, result) -> None:
                                              t_min=gate[0], t_max=gate[1])
     if not crossplot:
         st.warning("No well falls inside the inverted block (or the gate contains no valid log "
-                   "samples). Widen the subset on step 5 or the gate in the sidebar.")
+                   "samples). Widen the subset on step 6 or the gate in the sidebar.")
         return
 
     missing = [t.well for t in ties if t.well not in crossplot]
@@ -1135,11 +1362,12 @@ def main() -> None:
     show_flash()
     {
         STEPS[0]: page_data,
-        STEPS[1]: page_well_tie,
-        STEPS[2]: page_wavelet,
-        STEPS[3]: page_low_freq,
-        STEPS[4]: page_inversion,
-        STEPS[5]: page_results,
+        STEPS[1]: page_log_qc,
+        STEPS[2]: page_well_tie,
+        STEPS[3]: page_wavelet,
+        STEPS[4]: page_low_freq,
+        STEPS[5]: page_inversion,
+        STEPS[6]: page_results,
     }[step]()
 
 
