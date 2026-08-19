@@ -704,6 +704,51 @@ def test_marker_annotations_never_render_placeholder_text():
     assert "new text" not in texts, texts
 
 
+def test_every_summary_is_arrow_serialisable():
+    """Streamlit serialises tables through Arrow, which types a column once.
+
+    The summary dicts mix ints and formatted strings, so a naive transpose
+    produces an object column that Arrow rejects with ArrowTypeError. Streamlit
+    recovers by casting to string, so the table still renders -- and a full
+    traceback is logged for every redraw. This asserts the summaries convert
+    cleanly instead of relying on that fallback.
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    def kv(mapping):
+        rows = {str(k): ("" if v is None else str(v)) for k, v in mapping.items()}
+        return pd.DataFrame({"value": pd.Series(rows, dtype="string")})
+
+    vol, wells, ties, wav, lfm = build_case(n_iline=8, n_xline=8, n_wells=3)
+    op = inversion.calibrate_colour_operator(
+        inversion.design_colour_operator(vol, ties, 8.0, 60.0, 200.0), vol, ties, *GATE)
+    result = inversion.run_volume(vol, "model-based", wav.samples, lfm, max_iter=25)
+
+    well = wells[0]
+    well.attach_time_depth(data_io.load_time_depth(_buf(F3_TD)))
+    well.attach_track(data_io.load_well_track(_buf(F3_TRACK)))
+    well.attach_markers(data_io.load_markers(_buf(F3_MARKERS)))
+
+    tables = {
+        "volume": kv(vol.summary()),
+        "wavelet": kv(wav.summary()),
+        "low-frequency model": kv(lfm.summary()),
+        "colour operator": kv(op.summary()),
+        "inversion result": kv(result.summary()),
+        "time-depth": kv(well.time_depth.summary()),
+        "track": kv(well.track.summary()),
+        "wells": pd.DataFrame([w.summary() for w in wells]),
+        "curve inventory": pd.DataFrame(well.curve_inventory()),
+        "tie scores": pd.DataFrame(viz.tie_score_table(ties, wav.samples, *GATE)),
+    }
+    for name, frame in tables.items():
+        try:
+            pa.Table.from_pandas(frame, preserve_index=True)
+        except Exception as exc:  # noqa: BLE001
+            raise AssertionError(f"{name} is not Arrow-serialisable: {exc}") from exc
+
+
 def test_bulk_shift_is_not_cumulative():
     _, wells = data_io.make_synthetic_dataset(n_iline=5, n_xline=5, n_samples=80, n_wells=1)
     well = wells[0]

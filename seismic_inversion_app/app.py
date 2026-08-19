@@ -139,6 +139,21 @@ def invalidate(*keys: str) -> None:
         st.session_state[k] = None
 
 
+def kv_table(mapping: dict) -> pd.DataFrame:
+    """Render a summary dict as a two-column table Streamlit can serialise.
+
+    The summary dicts deliberately mix types -- counts as ints, formatted
+    ranges as strings.  Transposing a one-row frame puts all of that in a
+    single object column, and Arrow types a column from its first values, so a
+    string column carrying an int raises ``ArrowTypeError``.  Streamlit falls
+    back to a string cast and the table still renders, but it logs a full
+    traceback each time.  Casting here keeps the display identical and the
+    console clean.
+    """
+    rows = {str(k): ("" if v is None else str(v)) for k, v in mapping.items()}
+    return pd.DataFrame({"value": pd.Series(rows, dtype="string")})
+
+
 def show_error(exc: Exception, context: str) -> None:
     st.error(f"**{context}**\n\n{type(exc).__name__}: {exc}")
     with st.expander("Traceback"):
@@ -220,7 +235,7 @@ def page_data() -> None:
 
     st.divider()
     st.subheader("Volume")
-    st.dataframe(pd.DataFrame([vol.summary()]).T.rename(columns={0: "value"}),
+    st.dataframe(kv_table(vol.summary()),
                  width="stretch")
     if vol.text_header:
         with st.expander("Text header"):
@@ -596,7 +611,7 @@ def _aux_file_status(well) -> None:
         if well.time_depth is None:
             st.caption("No checkshot attached; the time axis comes from the curve assignment below.")
         else:
-            st.dataframe(pd.DataFrame([well.time_depth.summary()]).T.rename(columns={0: "value"}),
+            st.dataframe(kv_table(well.time_depth.summary()),
                          width="stretch")
             for message in well.time_depth.warnings():
                 st.warning(message)
@@ -612,7 +627,7 @@ def _aux_file_status(well) -> None:
         if well.track is None:
             st.caption("No deviation survey attached.")
         else:
-            st.dataframe(pd.DataFrame([well.track.summary()]).T.rename(columns={0: "value"}),
+            st.dataframe(kv_table(well.track.summary()),
                          width="stretch")
             if not well.track.is_vertical:
                 st.info(
@@ -979,7 +994,7 @@ def page_wavelet() -> None:
 
     st.divider()
     st.subheader("Wavelet QC")
-    st.dataframe(pd.DataFrame([wav.summary()]).T.rename(columns={0: "value"}),
+    st.dataframe(kv_table(wav.summary()),
                  width="stretch")
     for note in getattr(wav, "notes", []):
         st.warning(note)
@@ -1069,7 +1084,7 @@ def page_low_freq() -> None:
 
     st.divider()
     st.subheader("Model QC")
-    st.dataframe(pd.DataFrame([model.summary()]).T.rename(columns={0: "value"}),
+    st.dataframe(kv_table(model.summary()),
                  width="stretch")
     for note in model.notes:
         st.caption(f"- {note}")
@@ -1260,7 +1275,7 @@ def _coloured_controls(vol, ties, params):
     if op is None:
         return params, False, ["a designed operator (button above)"]
 
-    st.dataframe(pd.DataFrame([op.summary()]).T.rename(columns={0: "value"}), width="stretch")
+    st.dataframe(kv_table(op.summary()), width="stretch")
     st.plotly_chart(viz.colour_operator_figure(op), width="stretch")
     params["operator"] = op
     return params, True, []
@@ -1361,7 +1376,7 @@ def page_results() -> None:
         st.info("Run an inversion on step 6 first.")
         return
 
-    st.dataframe(pd.DataFrame([result.summary()]).T.rename(columns={0: "value"}),
+    st.dataframe(kv_table(result.summary()),
                  width="stretch")
     if result.is_subset:
         st.warning("This is a subset (preview) run. Sections below cover only the inverted block.")
