@@ -48,6 +48,190 @@ DEFAULT_BYTES = {
 # Containers
 # ==========================================================================
 
+# Sentinel used in :class:`CurveSelection.time` to mean "use the well's
+# time-depth / checkshot file" rather than a curve from the LAS.
+TD_SOURCE = "(time-depth file)"
+
+# Plausible interval velocity band, used to decide whether a time-depth column
+# is one-way or two-way when the file does not say.
+TD_VELOCITY_RANGE = (1400.0, 6500.0)
+
+
+@dataclass
+class Marker:
+    """A formation top / horizon pick at a measured depth."""
+
+    md: float
+    name: str
+    twt: float | None = None            # filled in once a time-depth exists
+
+
+@dataclass
+class TimeDepth:
+    """A checkshot or time-depth table: measured depth against two-way time."""
+
+    md: np.ndarray                       # metres
+    twt: np.ndarray                      # milliseconds, two-way
+    source: str = ""
+    was_one_way: bool = False
+    was_seconds: bool = True
+
+    def __post_init__(self) -> None:
+        self.md = np.asarray(self.md, dtype=float)
+        self.twt = np.asarray(self.twt, dtype=float)
+        order = np.argsort(self.md)
+        self.md, self.twt = self.md[order], self.twt[order]
+
+    @property
+    def datum_md(self) -> float:
+        """MD at which time is zero -- the seismic reference datum."""
+        if self.twt.size and np.nanmin(np.abs(self.twt)) < 1e-9:
+            return float(self.md[int(np.argmin(np.abs(self.twt)))])
+        return float(self.md[0])
+
+    def to_twt(self, md: np.ndarray) -> np.ndarray:
+        """Interpolate MD to TWT (ms).
+
+        Extrapolation beyond the table is linear in the end interval's
+        velocity rather than flat, so a log that runs slightly past the deepest
+        checkshot still gets a sensible -- and monotonic -- time.
+        """
+        md = np.asarray(md, dtype=float)
+        if self.md.size < 2:
+            return np.full(md.shape, np.nan)
+        out = np.interp(md, self.md, self.twt)
+
+        above = md < self.md[0]
+        if above.any():
+            grad = (self.twt[1] - self.twt[0]) / max(self.md[1] - self.md[0], 1e-9)
+            out[above] = self.twt[0] + (md[above] - self.md[0]) * grad
+        below = md > self.md[-1]
+        if below.any():
+            grad = (self.twt[-1] - self.twt[-2]) / max(self.md[-1] - self.md[-2], 1e-9)
+            out[below] = self.twt[-1] + (md[below] - self.md[-1]) * grad
+        return out
+
+    def interval_velocity(self) -> np.ndarray:
+        """Interval velocity (m/s) implied by consecutive table entries."""
+        dz = np.diff(self.md)
+        dt = np.diff(self.twt) / 1000.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(dt > 0, 2.0 * dz / dt, np.nan)
+
+    def warnings(self) -> list[str]:
+        """Flag a time-depth table that looks like a unit or convention mistake."""
+        out: list[str] = []
+        vi = self.interval_velocity()
+        vi = vi[np.isfinite(vi)]
+        if vi.size == 0:
+            return ["No interval velocity could be computed - check for duplicate depths."]
+
+        median = float(np.median(vi))
+
+        # Judge the shallow section rather than the whole table: compaction
+        # means near-surface rock is slow, so 3,800 m/s in the first second is
+        # a strong hint that one-way time has been read as two-way, while the
+        # same number at 3 s is unremarkable.
+        #
+        # The window is in *time*, not depth: a table that starts below the
+        # datum has no shallow section to judge, and using depth would need a
+        # datum this class cannot always know.
+        mid_time = 0.5 * (self.twt[1:] + self.twt[:-1])
+        vi_all = self.interval_velocity()
+        shallow = np.isfinite(vi_all) & (mid_time < 1500.0)
+        if shallow.sum() >= 2:
+            shallow_median = float(np.median(vi_all[shallow]))
+            if shallow_median > 3000:
+                out.append(
+                    f"Interval velocity in the first 1.5 s averages {shallow_median:,.0f} m/s, "
+                    "which is fast for shallow section. If this table is one-way time being read "
+                    "as two-way, every tie will be out by a factor of two - set the time unit "
+                    "explicitly instead of leaving it on 'auto'.")
+
+        if median < 1450:
+            out.append(
+                f"Median interval velocity is {median:,.0f} m/s, below the speed of sound in "
+                "water. Check the depth units and whether the time column is two-way.")
+        if vi.max() > 7000:
+            out.append(f"An interval reaches {vi.max():,.0f} m/s - check for a mis-keyed depth.")
+        if np.any(np.diff(self.twt) < 0):
+            out.append("Time does not increase monotonically with depth.")
+        return out
+
+    def summary(self) -> dict:
+        vi = self.interval_velocity()
+        vi = vi[np.isfinite(vi)]
+        return {
+            "points": int(self.md.size),
+            "MD range (m)": f"{self.md.min():.1f} - {self.md.max():.1f}",
+            "TWT range (ms)": f"{self.twt.min():.0f} - {self.twt.max():.0f}",
+            "datum MD (m)": f"{self.datum_md:.1f}",
+            "interval velocity (m/s)": (f"{vi.min():.0f} - {vi.max():.0f}" if vi.size else "n/a"),
+            "read as": ("one-way, doubled" if self.was_one_way else "two-way")
+                       + (", seconds" if self.was_seconds else ", milliseconds"),
+        }
+
+
+@dataclass
+class WellTrack:
+    """A deviation survey: map position and TVDSS against measured depth."""
+
+    md: np.ndarray
+    x: np.ndarray
+    y: np.ndarray
+    tvdss: np.ndarray                    # positive down, relative to the datum
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("md", "x", "y", "tvdss"):
+            setattr(self, name, np.asarray(getattr(self, name), dtype=float))
+        order = np.argsort(self.md)
+        self.md, self.x, self.y, self.tvdss = (
+            self.md[order], self.x[order], self.y[order], self.tvdss[order])
+
+    @property
+    def surface_xy(self) -> tuple[float, float]:
+        return float(self.x[0]), float(self.y[0])
+
+    @property
+    def kb(self) -> float:
+        """Height of MD zero above the datum (metres).
+
+        With TVDSS positive down, the shallowest station sits at a negative
+        TVDSS when the reference is above the datum -- which is the usual case
+        for a KB.
+        """
+        return float(-self.tvdss[0] + self.md[0])
+
+    @property
+    def is_vertical(self) -> bool:
+        return bool(np.allclose(self.x, self.x[0], atol=1.0)
+                    and np.allclose(self.y, self.y[0], atol=1.0))
+
+    @property
+    def max_deviation(self) -> float:
+        """Greatest horizontal step-out from the surface location (metres)."""
+        x0, y0 = self.surface_xy
+        return float(np.max(np.hypot(self.x - x0, self.y - y0)))
+
+    def xy_at(self, md: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        md = np.asarray(md, dtype=float)
+        return (np.interp(md, self.md, self.x), np.interp(md, self.md, self.y))
+
+    def tvdss_at(self, md: np.ndarray) -> np.ndarray:
+        return np.interp(np.asarray(md, dtype=float), self.md, self.tvdss)
+
+    def summary(self) -> dict:
+        return {
+            "stations": int(self.md.size),
+            "MD range (m)": f"{self.md.min():.1f} - {self.md.max():.1f}",
+            "surface X": f"{self.surface_xy[0]:.1f}",
+            "surface Y": f"{self.surface_xy[1]:.1f}",
+            "KB above datum (m)": f"{self.kb:.1f}",
+            "geometry": "vertical" if self.is_vertical else f"deviated, {self.max_deviation:.0f} m step-out",
+        }
+
+
 @dataclass
 class CurveSelection:
     """Which LAS curve fills each role, and the unit it is in.
@@ -238,6 +422,10 @@ class WellData:
     curve_units: dict[str, str] = field(default_factory=dict)
     curve_descr: dict[str, str] = field(default_factory=dict)
     selection: CurveSelection = field(default_factory=CurveSelection)
+    # Auxiliary files: checkshot, deviation survey, formation tops.
+    time_depth: TimeDepth | None = None
+    track: WellTrack | None = None
+    markers: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.md = np.asarray(self.md, dtype=float)
@@ -256,6 +444,9 @@ class WellData:
         """
         self.bulk_shift = float(milliseconds)
         self.twt = self._twt_base + float(milliseconds)
+        # Markers are picked in depth but displayed in time, so they move with
+        # the well or they would point at the wrong reflector.
+        self.refresh_marker_times()
 
     # -- curve assignment ------------------------------------------------
     def apply_selection(
@@ -290,7 +481,10 @@ class WellData:
             self.rho = np.full(self.md.shape, np.nan)
             notes.append("No density curve assigned")
 
-        if selection.time and selection.time in self.curves:
+        if selection.time == TD_SOURCE and self.time_depth is not None:
+            base = self.time_depth.to_twt(self.md)
+            notes.append(f"TWT from the time-depth file ({self.time_depth.md.size} points)")
+        elif selection.time and selection.time in self.curves:
             base = time_curve_to_twt_ms(self.curves[selection.time], selection.time_unit)
             notes.append(f"TWT from '{selection.time}' [{selection.time_unit}] (well assumed tied)")
         else:
@@ -345,6 +539,60 @@ class WellData:
         r_full = utils.reflectivity_from_ai(filled)
         r[good] = r_full[good]
         return r
+
+    # -- auxiliary files ---------------------------------------------------
+    def attach_time_depth(self, td: TimeDepth, prefer: bool = True) -> str:
+        """Attach a checkshot and, by default, adopt it as the time source.
+
+        A measured checkshot beats both a LAS time curve and sonic integration,
+        so it is adopted unless the caller says otherwise.
+        """
+        self.time_depth = td
+        self.refresh_marker_times()
+        if prefer:
+            selection = CurveSelection(**{**self.selection.__dict__})
+            selection.time = TD_SOURCE
+            self.apply_selection(selection)
+            return (f"time-depth attached ({td.md.size} points, "
+                    f"{td.twt.min():.0f}-{td.twt.max():.0f} ms) and adopted as the time source")
+        return f"time-depth attached ({td.md.size} points), not adopted"
+
+    def attach_track(self, track: WellTrack) -> str:
+        """Attach a deviation survey and take the surface location and KB from it."""
+        self.track = track
+        self.x, self.y = track.surface_xy
+        self.kb = track.kb
+        geometry = "vertical" if track.is_vertical else f"deviated ({track.max_deviation:.0f} m step-out)"
+        return (f"located at ({self.x:.1f}, {self.y:.1f}) from the deviation survey, "
+                f"KB {self.kb:.1f} m, {geometry}")
+
+    def attach_markers(self, markers: Sequence) -> str:
+        self.markers = list(markers)
+        self.refresh_marker_times()
+        return f"{len(self.markers)} markers attached"
+
+    def refresh_marker_times(self) -> None:
+        """Recompute each marker's TWT from the current time source.
+
+        Always derived from the *unshifted* time axis plus the current bulk
+        shift, so calling this repeatedly -- or after a shift changes -- lands
+        on the same answer instead of accumulating offsets.
+        """
+        if not self.markers:
+            return
+        md = np.array([m.md for m in self.markers], dtype=float)
+        if self.time_depth is not None:
+            base = self.time_depth.to_twt(md)
+        else:
+            good = np.isfinite(self.md) & np.isfinite(self._twt_base)
+            base = (np.interp(md, self.md[good], self._twt_base[good], left=np.nan, right=np.nan)
+                    if good.sum() > 1 else np.full(md.shape, np.nan))
+        for marker, t in zip(self.markers, base + self.bulk_shift):
+            marker.twt = float(t) if np.isfinite(t) else None
+
+    def markers_in_range(self, t_min: float, t_max: float) -> list:
+        return [m for m in self.markers
+                if m.twt is not None and t_min <= m.twt <= t_max]
 
     def curve_inventory(self) -> list[dict[str, Any]]:
         """Every curve in the LAS with its unit, description and statistics.
@@ -979,6 +1227,232 @@ def integrate_sonic_to_twt(
     t0 = max(start_depth, 0.0) / max(replacement_velocity, 1.0)
     twt[good] = 2.0 * (owt + t0) * 1000.0  # ms
     return twt
+
+
+# ==========================================================================
+# Auxiliary well files: time-depth, deviation survey, markers
+# ==========================================================================
+
+WELL_FILE_KINDS = ("time_depth", "track", "markers")
+
+# Filename suffixes stripped when matching an auxiliary file to a well.
+_AUX_SUFFIXES = ("_td", "_t-d", "_tz", "_checkshot", "_cs", "_markers", "_marker",
+                 "_tops", "_track", "_dev", "_deviation", "_survey", "_path")
+
+
+def _read_text(path_or_buffer) -> str:
+    """Read a text file from a path or an upload, tolerating CRLF and BOM."""
+    if hasattr(path_or_buffer, "read") and not isinstance(path_or_buffer, str):
+        raw = (path_or_buffer.getvalue() if hasattr(path_or_buffer, "getvalue")
+               else path_or_buffer.read())
+        text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, bytes) else raw
+    else:
+        with open(path_or_buffer, "r", encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _data_lines(text: str) -> list[str]:
+    """Non-empty, non-comment lines."""
+    out = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line and not line.startswith(("#", "!", "--")):
+            out.append(line)
+    return out
+
+
+def _is_number(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except ValueError:
+        return False
+
+
+def sniff_well_file(path_or_buffer) -> str | None:
+    """Identify an auxiliary well file from its contents, not its name.
+
+    Columns are the giveaway and are far more reliable than a file extension:
+    two numeric columns is a time-depth table, four is a deviation survey, and
+    a number followed by text is a marker list.  This is what lets the user
+    drop all of a well's files in at once.
+    """
+    lines = _data_lines(_read_text(path_or_buffer))
+    if not lines:
+        return None
+
+    votes: dict[str, int] = {}
+    for line in lines[:40]:
+        parts = line.split()
+        if len(parts) < 2 or not _is_number(parts[0]):
+            continue
+        numeric = [t for t in parts if _is_number(t)]
+        if len(numeric) == len(parts):
+            if len(parts) == 2:
+                votes["time_depth"] = votes.get("time_depth", 0) + 1
+            elif len(parts) >= 4:
+                votes["track"] = votes.get("track", 0) + 1
+            elif len(parts) == 3:
+                # Ambiguous: MD/TVD/time or X/Y/MD. Treated as a track below.
+                votes["track"] = votes.get("track", 0) + 1
+        else:
+            votes["markers"] = votes.get("markers", 0) + 1
+
+    return max(votes, key=votes.get) if votes else None
+
+
+def load_time_depth(path_or_buffer, time_unit: str = "auto", source: str = "") -> TimeDepth:
+    """Read a two-column checkshot / time-depth table (MD, time).
+
+    ``time_unit`` may be ``auto``, or one of :data:`TIME_UNITS`.  Auto-detection
+    resolves seconds against milliseconds by magnitude, then one-way against
+    two-way by which reading implies a plausible interval velocity -- a
+    misread here is a factor-of-two error in every tie downstream, so it is
+    worth deciding from the physics rather than from a filename.
+    """
+    lines = _data_lines(_read_text(path_or_buffer))
+    md_list, t_list = [], []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or not (_is_number(parts[0]) and _is_number(parts[1])):
+            continue
+        md_list.append(float(parts[0]))
+        t_list.append(float(parts[1]))
+
+    if len(md_list) < 2:
+        raise ValueError("time-depth file needs at least two 'MD time' rows")
+
+    md = np.asarray(md_list, dtype=float)
+    t = np.asarray(t_list, dtype=float)
+
+    if time_unit != "auto" and time_unit in TIME_UNITS:
+        seconds = time_unit.startswith("s ")
+        one_way = "OWT" in time_unit
+    else:
+        seconds = float(np.nanmax(np.abs(t))) < 20.0
+        one_way = _looks_one_way(md, t * (1000.0 if seconds else 1.0))
+
+    twt_ms = t * (1000.0 if seconds else 1.0)
+    if one_way:
+        twt_ms = twt_ms * 2.0
+
+    return TimeDepth(md=md, twt=twt_ms, source=source,
+                     was_one_way=bool(one_way), was_seconds=bool(seconds))
+
+
+def _looks_one_way(md: np.ndarray, t_ms: np.ndarray) -> bool:
+    """Decide whether a time column is one-way, from the implied velocity.
+
+    Reading the column as two-way gives ``v = 2 dz/dt``.  If that lands in the
+    plausible band the column is read as two-way; only when it is impossibly
+    fast, and halving it is plausible, is the column taken as one-way.
+
+    **This cannot always be decided.** A one-way table over a slow section
+    reads as a plausible fast section: halving the F3 F02-1 checkshot gives
+    3850 m/s, which is a perfectly ordinary rock velocity. Detection therefore
+    only catches the clearly impossible case; the ambiguous middle defaults to
+    two-way (much the commoner convention) and is reported in the summary as
+    "read as", with a manual override and a velocity warning to back it up.
+    """
+    order = np.argsort(md)
+    dz = np.diff(md[order])
+    dt = np.diff(t_ms[order]) / 1000.0
+    good = (dt > 1e-6) & (dz > 0)
+    if good.sum() < 1:
+        return False
+    v_twt = float(np.median(2.0 * dz[good] / dt[good]))
+    lo, hi = TD_VELOCITY_RANGE
+    if lo <= v_twt <= hi:
+        return False                      # two-way reading is plausible
+    if v_twt > hi and lo <= v_twt / 2.0 <= hi:
+        return True                       # only the one-way reading is plausible
+    return False
+
+
+def load_well_track(path_or_buffer, source: str = "") -> WellTrack:
+    """Read a deviation survey.
+
+    Handles the common OpendTect ``.track`` layout ``X Y Z MD`` (Z as TVDSS,
+    positive down), and tolerates mixed tab/space delimiters -- the F3 demo
+    tracks mix both on the same row.  A file whose Z decreases with MD is
+    treated as an elevation and flipped to TVDSS.
+    """
+    lines = _data_lines(_read_text(path_or_buffer))
+    rows = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 4 and all(_is_number(t) for t in parts[:4]):
+            rows.append([float(v) for v in parts[:4]])
+        elif len(parts) == 3 and all(_is_number(t) for t in parts):
+            # X Y MD, with no separate TVD column: treat MD as vertical depth.
+            x, y, md = (float(v) for v in parts)
+            rows.append([x, y, md, md])
+
+    if len(rows) < 1:
+        raise ValueError("deviation file needs rows of 'X Y Z MD'")
+
+    arr = np.asarray(rows, dtype=float)
+    x, y, z, md = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+
+    # A single station cannot define a path; treat it as a vertical well.
+    if arr.shape[0] == 1:
+        md = np.array([md[0], md[0] + 1.0])
+        z = np.array([z[0], z[0] + 1.0])
+        x = np.array([x[0], x[0]])
+        y = np.array([y[0], y[0]])
+
+    order = np.argsort(md)
+    if np.polyfit(md[order], z[order], 1)[0] < 0:
+        z = -z                            # elevation (positive up) -> TVDSS
+
+    return WellTrack(md=md, x=x, y=y, tvdss=z, source=source)
+
+
+def load_markers(path_or_buffer, source: str = "") -> list[Marker]:
+    """Read a formation-top list of ``MD  name``.
+
+    The name is everything after the depth, so tops with spaces in their names
+    -- ``Truncation 1``, ``NMRF (Mid_Mio_Unc)`` -- survive intact.
+    """
+    markers: list[Marker] = []
+    for line in _data_lines(_read_text(path_or_buffer)):
+        parts = line.split(None, 1)
+        if len(parts) < 2 or not _is_number(parts[0]):
+            continue
+        name = parts[1].strip()
+        if name:
+            markers.append(Marker(md=float(parts[0]), name=name))
+    if not markers:
+        raise ValueError("marker file needs rows of 'MD name'")
+    return sorted(markers, key=lambda m: m.md)
+
+
+def match_well_name(filename: str, well_names: Sequence[str]) -> str | None:
+    """Match an auxiliary filename to a loaded well.
+
+    Comparison strips the extension, any known role suffix (``_TD``,
+    ``_markers``, ...) and every non-alphanumeric character, so ``F02-1_TD.txt``
+    and ``F021_TD.txt`` both match a well called ``F02-1``.
+    """
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    key = stem.lower()
+    for suffix in _AUX_SUFFIXES:
+        if key.endswith(suffix):
+            key = key[: -len(suffix)]
+            break
+    key = "".join(ch for ch in key if ch.isalnum())
+    if not key:
+        return None
+
+    normalised = {name: "".join(ch for ch in name.lower() if ch.isalnum()) for name in well_names}
+    for name, norm in normalised.items():
+        if norm == key:
+            return name
+    # Fall back to the longest containment match, so "F02-1_sonic_edit" still
+    # finds "F02-1" without a shorter well name winning by accident.
+    candidates = [n for n, norm in normalised.items() if norm and (norm in key or key in norm)]
+    return max(candidates, key=lambda n: len(normalised[n])) if candidates else None
 
 
 def load_well_headers(path_or_buffer) -> pd.DataFrame:

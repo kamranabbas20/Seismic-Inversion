@@ -69,8 +69,8 @@ background model fails.
 
 | Step | What it does |
 | --- | --- |
-| **1 - Data** | SEG-Y + byte positions (with a header scan to identify non-standard ones), multi-well LAS, optional well-header and horizon CSVs. Or generate a synthetic dataset. |
-| **2 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks. |
+| **1 - Data** | SEG-Y + byte positions (with a header scan to identify non-standard ones), multi-well LAS, time-depth / deviation / marker files, optional well-header and horizon CSVs. Or generate a synthetic dataset. |
+| **2 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks, checkshot / deviation / marker review. |
 | **3 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
 | **4 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
 | **5 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
@@ -261,6 +261,57 @@ resolve here, rather than being rejected at the door and lost.
 
 ---
 
+## Time-depth, deviation and marker files
+
+Beyond the LAS, a well usually arrives with three companion files. Step 1
+accepts all of them together and tells them apart **by their contents**, not by
+their extension, then matches each to a well by filename (`F02-1_TD.txt` finds
+well `F02-1`; punctuation and role suffixes are ignored, so `F021_TD.txt` works
+too).
+
+| Kind | Columns | Example row |
+| --- | --- | --- |
+| Time-depth / checkshot | `MD  time` | `553.6  0.544` |
+| Deviation survey | `X  Y  TVDSS  MD` | `606554  6080126  1665  1695` |
+| Markers / tops | `MD  name` | `1285.09  NMRF (Mid_Mio_Unc)` |
+
+Whitespace or tab separated, no header required. Marker names may contain
+spaces — everything after the depth is the name.
+
+**The checkshot becomes the well's time source** when attached, in preference
+to a LAS time curve or sonic integration, since it is the only one of the three
+that was measured. The deviation survey supplies the surface location and KB,
+so a LAS with no X/Y in its header still ties. Markers are carried in time and
+drawn on the log tracks and the tie panel; two of them can set the analysis
+gate directly.
+
+### Reading the time column
+
+Seconds against milliseconds is decided by magnitude. One-way against two-way
+is decided from the implied interval velocity — but **only where that is
+decidable**. Reading the F3 F02-1 checkshot as two-way gives 1,925 m/s, so it
+is two-way; halving it gives 3,850 m/s, which is a perfectly ordinary rock
+velocity, so a one-way table over a slow section is genuinely ambiguous from
+the numbers alone.
+
+The loader therefore defaults to two-way (much the commoner convention) rather
+than guessing, reports how it read the file in the summary, offers an explicit
+override, and warns when the first 1.5 s averages above 3,000 m/s — fast for
+shallow section, and the signature of exactly that mistake. The check is
+windowed in time rather than depth so a table that starts below the datum is
+not judged as though it were shallow.
+
+### Deviated wells
+
+The deviation survey is parsed and its geometry reported, and a `Z` column that
+decreases with MD is treated as an elevation and flipped to TVDSS. But v1
+extracts the seismic trace at the **surface** location; for a strongly deviated
+well that is not where the logs are, so the app says so on step 2 rather than
+quietly tying the wrong trace. Extracting along the deviated path is an
+extension point, not a v1 feature.
+
+---
+
 ## Well ties
 
 The app assumes wells are **already tied** — the time-depth relationship, and
@@ -273,8 +324,11 @@ to build one:
   seismic datum by a replacement velocity. With no checkshot to calibrate
   against, absolute time is only as good as the sonic — treat it as a starting
   point.
-- A constant **bulk shift** per well is available for a datum error. Stretch
-  and squeeze are out of scope for v1 (see *Not in this version*).
+- A **checkshot** attached on step 1 takes precedence over both, and is the
+  preferred route (see above).
+- A constant **bulk shift** per well is available for a datum error; markers
+  move with it. Stretch and squeeze are out of scope for v1 (see *Not in this
+  version*).
 
 Each well is located against the seismic grid by KD-tree lookup of the nearest
 *live* traces, blended by inverse-distance weighting. Restricting the search to
@@ -366,3 +420,6 @@ otherwise:
   posterior distribution.
 - **Multi-horizon flattening.** With several horizons loaded, v1 flattens on the
   first rather than doing proportional layer-cake flattening between them.
+- **Deviated-well trace extraction.** Deviation surveys are read and reported,
+  but the seismic trace is taken at the surface location, not along the
+  borehole path.

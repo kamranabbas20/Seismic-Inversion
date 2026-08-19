@@ -506,6 +506,204 @@ def test_synthetic_wells_carry_curves_like_a_real_las():
         assert np.allclose(well.vp, vp_before, rtol=1e-9)
 
 
+# --------------------------------------------------------------------------
+# Auxiliary well files (time-depth, deviation, markers) -- F3 demo layout
+# --------------------------------------------------------------------------
+
+# Real F02-1 values from the F3 demo survey, in the file layouts it ships with:
+# tab-separated, no header, times in seconds, markers with spaces in the name,
+# and a track that mixes tabs and spaces on the same row.
+F3_TD = "\n".join([
+    "30\t0", "553.6\t0.544", "612.9\t0.607", "683.31\t0.675", "716.65\t0.712",
+    "748.49\t0.748", "795.18\t0.794", "927.28\t0.932", "1025.42\t1.031",
+    "1285.09\t1.242", "1695\t1.67", "1872\t1.861", "2636\t2.682", "3150\t3.234",
+])
+F3_MARKERS = "\r\n".join([
+    "30\tSeasurface", "553.6\tMFS11", "1025.42\tTruncation 1",
+    "1048.84\tLower Low Sonic", "1285.09\tNMRF (Mid_Mio_Unc)", "1695\tCKGR",
+])
+F3_TRACK = "606554\t6080126  -30       0\n606554\t6080126\t1665\t1695\n"
+
+
+def _buf(text: str):
+    import io as _io
+    return _io.StringIO(text)
+
+
+def test_sniffing_tells_the_three_file_kinds_apart():
+    assert data_io.sniff_well_file(_buf(F3_TD)) == "time_depth"
+    assert data_io.sniff_well_file(_buf(F3_MARKERS)) == "markers"
+    assert data_io.sniff_well_file(_buf(F3_TRACK)) == "track"
+
+
+def test_time_depth_reads_seconds_as_two_way():
+    td = data_io.load_time_depth(_buf(F3_TD))
+    assert td.was_seconds and not td.was_one_way
+    assert abs(td.twt.max() - 3234.0) < 1e-6, "3.234 s should become 3234 ms"
+    assert abs(td.datum_md - 30.0) < 1e-6, "time zero sits at MD 30 (the KB)"
+
+    vi = td.interval_velocity()
+    vi = vi[np.isfinite(vi)]
+    assert 1400 < vi.min() and vi.max() < 3200, f"implausible interval velocity {vi.min()}-{vi.max()}"
+
+    # Interpolation must reproduce the table exactly at its own knots.
+    assert abs(float(td.to_twt(np.array([553.6]))[0]) - 544.0) < 1e-6
+
+
+def test_one_way_time_depth_is_detected_when_it_can_be():
+    """Detection only fires where the two-way reading is physically impossible."""
+    # A fast section (~4600 m/s) recorded one-way: read as two-way it implies
+    # ~9200 m/s, which no rock does, so the one-way reading is forced.
+    fast_one_way = "\n".join(f"{md}\t{md / 4600.0:.6f}" for md in (0, 500, 1500, 3000))
+    td = data_io.load_time_depth(_buf(fast_one_way))
+    assert td.was_one_way
+    vi = td.interval_velocity()
+    assert abs(float(np.median(vi[np.isfinite(vi)])) - 4600) < 50
+
+
+def test_ambiguous_one_way_defaults_to_two_way_and_warns():
+    """Halving the F3 checkshot gives 3850 m/s -- a plausible rock velocity.
+
+    Velocity alone cannot resolve this, so the loader must default to two-way
+    (the commoner convention) rather than guess, and say so loudly enough that
+    the user can override it.
+    """
+    halved = "\n".join(f"{md}\t{t / 2:.6f}" for md, t in
+                       [(30, 0.0), (553.6, 0.544), (1285.09, 1.242), (3150, 3.234)])
+    td = data_io.load_time_depth(_buf(halved))
+    assert not td.was_one_way, "must not guess when the reading is plausible"
+    assert any("fast for shallow section" in w for w in td.warnings()), td.warnings()
+
+    forced = data_io.load_time_depth(_buf(halved), time_unit="s (OWT)")
+    assert forced.was_one_way and abs(forced.twt.max() - 3234.0) < 1e-3
+
+
+def test_time_depth_warnings_stay_quiet_on_a_good_table():
+    assert data_io.load_time_depth(_buf(F3_TD)).warnings() == []
+
+
+def test_time_depth_unit_can_be_forced():
+    td = data_io.load_time_depth(_buf(F3_TD), time_unit="s (OWT)")
+    assert td.was_one_way and abs(td.twt.max() - 6468.0) < 1e-6, "explicit unit must win"
+
+
+def test_track_gives_location_kb_and_geometry():
+    track = data_io.load_well_track(_buf(F3_TRACK))
+    assert track.surface_xy == (606554.0, 6080126.0)
+    assert abs(track.kb - 30.0) < 1e-6, "TVDSS -30 at MD 0 means KB is 30 m above the datum"
+    assert track.is_vertical
+    assert abs(track.tvdss_at(np.array([1695.0]))[0] - 1665.0) < 1e-6
+
+
+def test_track_flips_an_elevation_convention():
+    """Z decreasing with MD is an elevation, not a depth."""
+    elevation = "600000 6080000 30 0\n600000 6080000 -1665 1695\n"
+    track = data_io.load_well_track(_buf(elevation))
+    assert track.tvdss[-1] > track.tvdss[0], "should be flipped to positive-down"
+    assert abs(track.kb - 30.0) < 1e-6
+
+
+def test_markers_keep_names_containing_spaces():
+    markers = data_io.load_markers(_buf(F3_MARKERS))
+    names = [m.name for m in markers]
+    assert "Truncation 1" in names
+    assert "NMRF (Mid_Mio_Unc)" in names
+    assert "Lower Low Sonic" in names
+    assert markers == sorted(markers, key=lambda m: m.md)
+
+
+def test_attaching_aux_files_drives_time_location_and_markers():
+    _, wells = data_io.make_synthetic_dataset(n_iline=6, n_xline=6, n_samples=100, n_wells=1)
+    well = wells[0]
+
+    well.attach_track(data_io.load_well_track(_buf(F3_TRACK)))
+    assert well.has_location and abs(well.x - 606554.0) < 1e-6
+    assert abs(well.kb - 30.0) < 1e-6
+
+    well.attach_markers(data_io.load_markers(_buf(F3_MARKERS)))
+    well.attach_time_depth(data_io.load_time_depth(_buf(F3_TD)))
+    assert well.selection.time == data_io.TD_SOURCE, "a checkshot should be adopted by default"
+
+    times = {m.name: m.twt for m in well.markers}
+    assert abs(times["MFS11"] - 544.0) < 1e-6, "marker time must come from the checkshot"
+    assert abs(times["CKGR"] - 1670.0) < 1e-6
+
+
+def test_marker_times_follow_a_bulk_shift_and_stay_idempotent():
+    _, wells = data_io.make_synthetic_dataset(n_iline=6, n_xline=6, n_samples=100, n_wells=1)
+    well = wells[0]
+    well.attach_markers(data_io.load_markers(_buf(F3_MARKERS)))
+    well.attach_time_depth(data_io.load_time_depth(_buf(F3_TD)))
+
+    base = {m.name: m.twt for m in well.markers}
+    well.set_bulk_shift(20.0)
+    assert abs({m.name: m.twt for m in well.markers}["MFS11"] - (base["MFS11"] + 20.0)) < 1e-6
+
+    for _ in range(3):
+        well.refresh_marker_times()
+    assert abs({m.name: m.twt for m in well.markers}["MFS11"] - (base["MFS11"] + 20.0)) < 1e-6, \
+        "refreshing must not accumulate the shift"
+
+    well.set_bulk_shift(0.0)
+    assert abs({m.name: m.twt for m in well.markers}["MFS11"] - base["MFS11"]) < 1e-6
+
+
+def test_aux_filename_matching_tolerates_punctuation():
+    names = ["F02-1", "F03-2", "F03-4"]
+    assert data_io.match_well_name("F021_TD.txt", names) == "F02-1"
+    assert data_io.match_well_name("F02-1_markers.txt", names) == "F02-1"
+    assert data_io.match_well_name("F021.track", names) == "F02-1"
+    assert data_io.match_well_name("F03-4_checkshot.dat", names) == "F03-4"
+    assert data_io.match_well_name("UNRELATED.txt", names) is None
+
+
+def test_checkshot_time_axis_feeds_the_inversion():
+    """A well timed by checkshot must tie and invert like any other."""
+    vol, wells = data_io.make_synthetic_dataset(n_iline=10, n_xline=10, n_samples=300,
+                                                n_wells=2, seed=11)
+    well = wells[0]
+    # Re-time the well from its own curve, expressed as a coarse checkshot table.
+    md = well.md[::200]
+    twt = well.twt[::200]
+    table = "\n".join(f"{m}\t{t / 1000.0:.6f}" for m, t in zip(md, twt))
+    well.attach_time_depth(data_io.load_time_depth(_buf(table)))
+    assert well.selection.time == data_io.TD_SOURCE
+
+    ties = data_io.extract_well_traces(vol, wells)
+    assert len(ties) == 2
+    tie = next(t for t in ties if t.well == well.name)
+    assert np.isfinite(tie.ai).sum() > 50, "checkshot timing should still land the log in the cube"
+
+
+def test_time_depth_figure_builds():
+    td = data_io.load_time_depth(_buf(F3_TD))
+    markers = data_io.load_markers(_buf(F3_MARKERS))
+    for marker in markers:
+        marker.twt = float(td.to_twt(np.array([marker.md]))[0])
+    assert len(viz.time_depth_figure(td, markers).data) > 0
+
+
+def test_marker_labels_are_thinned_without_dropping_lines():
+    """Every top gets a line; only the text is thinned where they crowd."""
+    items = [(30.0, "Seasurface"), (553.6, "MFS11"), (612.9, "FS11"),
+             (683.3, "MFS10"), (716.6, "MFS9"), (3150.0, "SLCL")]
+    thinned = viz._thin_labels(items, span=3120.0)
+    assert len(thinned) == len(items), "no marker line may be dropped"
+    labelled = [n for _, n in thinned if n]
+    assert 0 < len(labelled) < len(items), "crowded labels should be thinned"
+    assert "Seasurface" in labelled and "SLCL" in labelled
+
+
+def test_marker_annotations_never_render_placeholder_text():
+    """Plotly turns annotation_text=None into the literal string 'new text'."""
+    td = data_io.load_time_depth(_buf(F3_TD))
+    markers = data_io.load_markers(_buf(F3_MARKERS))
+    for marker in markers:
+        marker.twt = float(td.to_twt(np.array([marker.md]))[0])
+    texts = [a.text for a in viz.time_depth_figure(td, markers).layout.annotations]
+    assert "new text" not in texts, texts
+
+
 def test_bulk_shift_is_not_cumulative():
     _, wells = data_io.make_synthetic_dataset(n_iline=5, n_xline=5, n_samples=80, n_wells=1)
     well = wells[0]

@@ -252,6 +252,7 @@ def page_data() -> None:
             chosen = next(w for w in wells if w.name == pick)
             st.plotly_chart(viz.well_log_figure(chosen), width="stretch")
 
+    _aux_well_files()
     _optional_files()
 
 
@@ -397,6 +398,93 @@ def _las_loader() -> None:
             flash(f"Loaded {len(wells)} wells.{note}")
 
 
+def _aux_well_files() -> None:
+    """Time-depth, deviation and marker files, routed by content."""
+    st.divider()
+    st.subheader("Well time-depth, deviation and markers")
+    wells = st.session_state.wells
+    if not wells:
+        st.caption("Load wells first, then drop their auxiliary files here.")
+        return
+
+    st.markdown(
+        "Drop **all** of a well's files in together - checkshots, deviation surveys and "
+        "formation tops are told apart by their contents, and matched to a well by filename "
+        "(`F02-1_TD.txt` finds well `F02-1`)."
+    )
+    with st.expander("Expected formats"):
+        st.markdown(
+            "| Kind | Columns | Example |\n| --- | --- | --- |\n"
+            "| Time-depth / checkshot | `MD  time` | `553.6  0.544` |\n"
+            "| Deviation survey | `X  Y  TVDSS  MD` | `606554  6080126  1665  1695` |\n"
+            "| Markers / tops | `MD  name` | `1285.09  NMRF (Mid_Mio_Unc)` |\n\n"
+            "Whitespace or tab separated, no header needed. Seconds against milliseconds and "
+            "one-way against two-way are detected from the implied interval velocity; override "
+            "below if a file is read wrongly."
+        )
+
+    c1, c2 = st.columns([2, 1])
+    with c2:
+        time_unit = st.selectbox(
+            "Time-depth unit", ["auto"] + list(data_io.TIME_UNITS),
+            help="'auto' picks seconds against milliseconds by magnitude, then one-way against "
+                 "two-way by which gives a plausible interval velocity.")
+        prefer_td = st.checkbox(
+            "Adopt checkshot as the time source", value=True,
+            help="A measured checkshot beats a LAS time curve and sonic integration.")
+    with c1:
+        files = st.file_uploader(
+            "Time-depth, deviation and marker files",
+            type=["txt", "csv", "dat", "track", "asc", "tz", "md"],
+            accept_multiple_files=True, key="aux_well_files")
+
+    if not files or not st.button("Attach well files", type="primary"):
+        return
+
+    names = [w.name for w in wells]
+    applied, problems = [], []
+    for handle in files:
+        try:
+            kind = data_io.sniff_well_file(handle)
+            target = data_io.match_well_name(handle.name, names)
+            if kind is None:
+                problems.append(f"**{handle.name}**: could not identify the file type.")
+                continue
+            if target is None:
+                problems.append(
+                    f"**{handle.name}**: no well matched. Wells loaded: {', '.join(names)}.")
+                continue
+
+            well = next(w for w in wells if w.name == target)
+            if kind == "time_depth":
+                td = data_io.load_time_depth(handle, time_unit=time_unit, source=handle.name)
+                message = well.attach_time_depth(td, prefer=prefer_td)
+            elif kind == "track":
+                message = well.attach_track(data_io.load_well_track(handle, source=handle.name))
+            else:
+                message = well.attach_markers(data_io.load_markers(handle, source=handle.name))
+            applied.append(f"**{handle.name}** -> {target}: {message}")
+        except Exception as exc:  # noqa: BLE001 - report per file, keep the rest
+            problems.append(f"**{handle.name}**: {exc}")
+
+    rebuild_ties("well auxiliary files attached")
+    invalidate("wavelet", "colour_operator", "lfm", "result")
+
+    if problems:
+        # Rendered here rather than flashed, so the detail survives alongside
+        # whatever did attach and the user can see both at once.
+        st.error("\n\n".join(f"- {m}" for m in problems))
+    if applied:
+        log(f"attached {len(applied)} well files")
+        detail = "\n\n".join(f"- {m}" for m in applied)
+        if problems:
+            st.success(detail)
+        else:
+            # flash() reruns, so the per-file detail has to travel with it or
+            # it would be wiped by the redraw.
+            flash(f"Attached {len(applied)} well files - check them on step 2 (Log QC).\n\n{detail}")
+
+
 def _optional_files() -> None:
     st.divider()
     st.subheader("Optional: well headers and horizons")
@@ -454,6 +542,8 @@ def page_log_qc() -> None:
 
     _log_qc_flags(well, vol)
 
+    _aux_file_status(well)
+
     st.divider()
     st.subheader("Curve assignment")
     st.caption(f"Currently: {well.selection.describe()}")
@@ -491,6 +581,78 @@ def page_log_qc() -> None:
     } for w in wells]), hide_index=True, width="stretch")
 
 
+def _aux_file_status(well) -> None:
+    """Show what the time-depth, deviation and marker files contributed."""
+    if not (well.time_depth or well.track or well.markers):
+        st.caption("No time-depth, deviation or marker file attached "
+                   "(upload them on step 1).")
+        return
+
+    st.divider()
+    st.subheader("Time-depth, deviation and markers")
+    tabs = st.tabs(["Time-depth", "Deviation", "Markers"])
+
+    with tabs[0]:
+        if well.time_depth is None:
+            st.caption("No checkshot attached; the time axis comes from the curve assignment below.")
+        else:
+            st.dataframe(pd.DataFrame([well.time_depth.summary()]).T.rename(columns={0: "value"}),
+                         width="stretch")
+            for message in well.time_depth.warnings():
+                st.warning(message)
+            in_use = well.selection.time == data_io.TD_SOURCE
+            (st.success if in_use else st.warning)(
+                "This checkshot is the well's time source."
+                if in_use else
+                "Attached but not in use - select "
+                f"`{data_io.TD_SOURCE}` as the time curve below to adopt it.")
+            st.plotly_chart(viz.time_depth_figure(well.time_depth, well.markers), width="stretch")
+
+    with tabs[1]:
+        if well.track is None:
+            st.caption("No deviation survey attached.")
+        else:
+            st.dataframe(pd.DataFrame([well.track.summary()]).T.rename(columns={0: "value"}),
+                         width="stretch")
+            if not well.track.is_vertical:
+                st.info(
+                    f"This well deviates up to {well.track.max_deviation:.0f} m from its surface "
+                    "location. v1 extracts the seismic trace at the **surface** position; for a "
+                    "strongly deviated well that is not where the logs are.")
+
+    with tabs[2]:
+        if not well.markers:
+            st.caption("No markers attached.")
+        else:
+            rows = [{"marker": m.name, "MD (m)": round(m.md, 2),
+                     "TWT (ms)": round(m.twt, 1) if m.twt is not None else None}
+                    for m in well.markers]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            _gate_from_markers(well)
+
+
+def _gate_from_markers(well) -> None:
+    """Let the user set the analysis gate from two formation tops."""
+    timed = [m for m in well.markers if m.twt is not None]
+    if len(timed) < 2:
+        st.caption("At least two markers need a time before a gate can be set from them.")
+        return
+    names = [f"{m.name}  ({m.twt:.0f} ms)" for m in timed]
+    c1, c2, c3 = st.columns([2, 2, 1])
+    top = c1.selectbox("Gate top", names, index=0, key="gate_top")
+    base = c2.selectbox("Gate base", names, index=len(names) - 1, key="gate_base")
+    t0 = timed[names.index(top)].twt
+    t1 = timed[names.index(base)].twt
+    c3.markdown("&nbsp;")
+    if c3.button("Set gate", width="stretch"):
+        if t1 <= t0:
+            st.error("The base marker must be deeper in time than the top.")
+            return
+        st.session_state.gate = (round(t0), round(t1))
+        flash(f"Analysis gate set to {t0:.0f} - {t1:.0f} ms "
+              f"({timed[names.index(top)].name} to {timed[names.index(base)].name}).")
+
+
 def _log_qc_flags(well, vol) -> None:
     """Render the pass/warn/fail checks for one well."""
     flags = well.qc_flags(vol.twt if vol is not None else None)
@@ -513,6 +675,20 @@ def _log_qc_flags(well, vol) -> None:
                 st.markdown(f"- {message}")
 
 
+def _time_for(time_source, target, apply_all: bool, is_origin: bool):
+    """Resolve the time source for one well when applying an assignment.
+
+    Pushing a role onto another well only makes sense if that well can honour
+    it: the checkshot option needs its own time-depth file, and a curve name
+    needs that curve to exist.
+    """
+    if time_source == data_io.TD_SOURCE:
+        return data_io.TD_SOURCE if target.time_depth is not None else None
+    if time_source is None or time_source in target.curves:
+        return time_source
+    return None if (apply_all and not is_origin) else time_source
+
+
 def _curve_assignment_form(well, vol) -> None:
     """Editor for the well name and the curve/unit assignment."""
     if not well.curves:
@@ -522,6 +698,9 @@ def _curve_assignment_form(well, vol) -> None:
         return
 
     options = ["(none)"] + list(well.curves)
+    time_options = list(options)
+    if well.time_depth is not None:
+        time_options.insert(1, data_io.TD_SOURCE)
 
     def index_of(mnemonic):
         return options.index(mnemonic) if mnemonic in options else 0
@@ -550,7 +729,9 @@ def _curve_assignment_form(well, vol) -> None:
 
         c5, c6 = st.columns(2)
         time_curve = c5.selectbox(
-            "Time curve", options, index=index_of(well.selection.time),
+            "Time curve", time_options,
+            index=(time_options.index(well.selection.time)
+                   if well.selection.time in time_options else 0),
             help="Leave as (none) to integrate the sonic instead. Wells are assumed tied "
                  "upstream, so a TWT curve in the LAS is preferred where one exists.")
         time_unit = c6.selectbox(
@@ -605,8 +786,7 @@ def _curve_assignment_form(well, vol) -> None:
             density=selection.density if selection.density in target.curves else (
                 None if apply_all and target is not well else selection.density),
             density_unit=selection.density_unit,
-            time=selection.time if selection.time in target.curves else (
-                None if apply_all and target is not well else selection.time),
+            time=_time_for(selection.time, target, apply_all, target is well),
             time_unit=selection.time_unit,
             constant_vp=selection.constant_vp,
         )
@@ -699,8 +879,10 @@ def page_well_tie() -> None:
                    "depend on the tie.")
 
     with c1:
-        st.plotly_chart(viz.well_tie_figure(tie, qc_samples, gate[0], gate[1]),
-                        width="stretch")
+        st.plotly_chart(
+            viz.well_tie_figure(tie, qc_samples, gate[0], gate[1],
+                                markers=well.markers_in_range(gate[0], gate[1])),
+            width="stretch")
 
 
 # ==========================================================================

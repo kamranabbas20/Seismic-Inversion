@@ -338,6 +338,7 @@ def well_tie_figure(
     t_min: float | None = None,
     t_max: float | None = None,
     height: int = 620,
+    markers=None,
 ) -> go.Figure:
     """Reflectivity, synthetic-vs-extracted overlay, and the residual.
 
@@ -377,11 +378,14 @@ def well_tie_figure(
             fig.add_hrect(y0=t_min, y1=t_max, fillcolor="orange", opacity=0.07,
                           line_width=0, row=1, col=col)
 
+    _add_markers(fig, markers, axis="twt", n_cols=4)
+
     fig.update_yaxes(autorange="reversed", title_text="TWT (ms)", row=1, col=1)
     for col in range(2, 5):
         fig.update_yaxes(autorange="reversed", row=1, col=col)
     fig.update_layout(
         template=_TEMPLATE, height=height,
+        margin_r=95,
         title=(f"{tie.well} &nbsp;|&nbsp; IL {tie.iline} / XL {tie.xline} "
                f"({tie.distance:.0f} m, {tie.n_neighbours} traces blended) &nbsp;|&nbsp; "
                f"correlation {corr:.3f} &nbsp;|&nbsp; best lag {lag * dt_ms:+.0f} ms (r={lag_corr:.3f})"),
@@ -527,6 +531,92 @@ def well_log_figure(well, twt_axis: np.ndarray | None = None, height: int = 620)
     return fig
 
 
+def time_depth_figure(td, markers=None, height: int = 480) -> go.Figure:
+    """A checkshot as time against depth, beside the interval velocity it implies.
+
+    The velocity panel is the one that matters for QC: a mis-keyed depth or a
+    one-way/two-way mistake shows up there as a spike or a factor-of-two step,
+    while the time-depth curve itself still looks smooth.
+    """
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.08,
+                        subplot_titles=("Time-depth", "Interval velocity"))
+
+    fig.add_trace(go.Scatter(x=td.twt, y=td.md, mode="lines+markers",
+                             line=dict(color="#4f81bd", width=2), marker=dict(size=5),
+                             name="checkshot"), row=1, col=1)
+
+    vi = td.interval_velocity()
+    mid = 0.5 * (td.md[1:] + td.md[:-1])
+    good = np.isfinite(vi)
+    fig.add_trace(go.Scatter(x=vi[good], y=mid[good], mode="lines+markers",
+                             line=dict(color="#c0504d", width=1.5, shape="hv"),
+                             marker=dict(size=4), name="interval velocity"), row=1, col=2)
+
+    span = float(td.md.max() - td.md.min()) or 1.0
+    for depth, label in _thin_labels([(m.md, m.name) for m in (markers or [])], span):
+        _hline(fig, depth, label, row=1, col=1)
+
+    fig.update_xaxes(title_text="TWT (ms)", row=1, col=1)
+    fig.update_xaxes(title_text="m/s", row=1, col=2)
+    fig.update_yaxes(title_text="MD (m)", autorange="reversed", row=1, col=1)
+    fig.update_yaxes(autorange="reversed", row=1, col=2)
+    fig.update_layout(template=_TEMPLATE, height=height, showlegend=False,
+                      margin=dict(l=60, r=90, t=45, b=45))
+    return fig
+
+
+def _hline(fig, y, label, row: int, col: int) -> None:
+    """Horizontal marker line, annotated only when a label is supplied.
+
+    Plotly renders ``annotation_text=None`` as the literal string "new text",
+    so the annotation arguments have to be omitted entirely rather than passed
+    as None.
+    """
+    kwargs = dict(y=y, line=dict(color="#7f7f7f", width=0.7, dash="dot"), row=row, col=col)
+    if label:
+        kwargs.update(annotation_text=label, annotation_position="right",
+                      annotation_font_size=9)
+    fig.add_hline(**kwargs)
+
+
+def _thin_labels(items, span: float, min_gap_fraction: float = 0.05):
+    """Keep every line but drop labels that would overlap.
+
+    A well with twenty-five tops over three kilometres renders its names into
+    an unreadable stack.  Lines still mark every top; only the text is thinned,
+    so nothing is hidden -- it just stops fighting for the same pixels.
+    """
+    ordered = sorted((v, n) for v, n in items if v is not None and np.isfinite(v))
+    if not ordered:
+        return []
+    min_gap = abs(span) * min_gap_fraction
+    out, last = [], None
+    for value, name in ordered:
+        if last is None or abs(value - last) >= min_gap:
+            out.append((value, name))
+            last = value
+        else:
+            out.append((value, None))       # line without a label
+    return out
+
+
+def _add_markers(fig, markers, axis: str, n_cols: int) -> None:
+    """Draw formation tops across every track of a figure.
+
+    ``axis`` is ``md`` or ``twt`` -- the caller knows which the y-axis carries,
+    and a marker plotted against the wrong one is worse than no marker at all.
+    """
+    values = [(m.md if axis == "md" else m.twt, m.name) for m in (markers or [])]
+    finite = [v for v, _ in values if v is not None and np.isfinite(v)]
+    if not finite:
+        return
+    span = (max(finite) - min(finite)) or 1.0
+
+    for value, label in _thin_labels(values, span):
+        for col in range(1, n_cols + 1):
+            _hline(fig, value, label if col == n_cols else None, row=1, col=col)
+
+
 def log_qc_figure(well, vp_range=None, rho_range=None, height: int = 620) -> go.Figure:
     """Assigned Vp / density / AI against depth, with out-of-range samples marked.
 
@@ -561,6 +651,8 @@ def log_qc_figure(well, vp_range=None, rho_range=None, height: int = 620) -> go.
                                      showlegend=(col == 1)), row=1, col=col)
         for edge in (lo, hi):
             fig.add_vline(x=edge, line=dict(color="grey", width=1, dash="dot"), row=1, col=col)
+
+    _add_markers(fig, getattr(well, "markers", None), axis="md", n_cols=3)
 
     fig.update_yaxes(autorange="reversed", title_text="MD (m)", row=1, col=1)
     for col in (2, 3):
