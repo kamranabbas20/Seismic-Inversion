@@ -202,7 +202,8 @@ def test_common_interface_is_common():
                 "synthetic", "residual", "misfit", "correlation"}
     for method, extra in [("coloured", {"operator": op}),
                           ("sparse-spike", {"sparsity": 0.15}),
-                          ("model-based", {})]:
+                          ("model-based", {}),
+                          ("bayesian", {})]:
         res = inversion.invert(trace, wav.samples, lf, method=method, dt=vol.dt, **extra)
         assert required <= set(res), f"{method} missing {required - set(res)}"
         for key in ("reflectivity", "relative_ai", "absolute_ai"):
@@ -991,6 +992,177 @@ def test_arbitrary_line_figure_builds():
     fig = viz.arbitrary_line_figure(line)
     assert len(fig.data) > 0
     assert [a.text for a in fig.layout.annotations] == [w.name for w in wells]
+
+
+# --------------------------------------------------------------------------
+# Bayesian linear inversion
+# --------------------------------------------------------------------------
+
+def test_roughness_operator_ignores_constants_and_ramps():
+    """A curvature penalty must be blind to level and slope.
+
+    Left with truncated first and last rows the operator reads ``[-2, 1]`` at
+    the edges, so a flat trace scores a large "roughness" and any penalty built
+    on it drags the level of log-impedance toward zero rather than smoothing
+    it.  That silently biased both the model-based and Bayesian engines.
+    """
+    L = inversion.second_difference_matrix(24).toarray()
+    constant = np.full(24, 15.3)
+    ramp = np.linspace(10.0, 20.0, 24)
+    curved = np.arange(24.0) ** 2
+
+    assert float(np.sum((L @ constant) ** 2)) < 1e-18, "a constant has no curvature"
+    assert float(np.sum((L @ ramp) ** 2)) < 1e-18, "a linear ramp has no curvature"
+    assert float(np.sum((L @ curved) ** 2)) > 1.0, "a parabola does"
+
+
+def test_bayesian_prior_mean_is_the_background_model():
+    """With the data ignored the posterior must land exactly on the background.
+
+    This is the property the roughness-operator bug broke: the penalty pulled
+    the prior mean off the background, so the "prior" the user configured was
+    not the model they built.
+    """
+    vol, wells, ties, wav, lfm = build_case(n_wells=3)
+    tie = ties[0]
+    lf = lfm.trace(tie.il_index, tie.xl_index)
+    for smoothness in (0.0, 0.05, 1.0):
+        res = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples, lf,
+                               method="bayesian", dt=vol.dt, noise_pct=1e6,
+                               smoothness=smoothness, uncertainty=False)
+        drift = np.max(np.abs(res["log_impedance"] - res["background_log_impedance"]))
+        assert drift < 1e-3, f"smoothness={smoothness} drifted {drift:.3g} from the background"
+
+
+def test_bayesian_matches_the_dense_closed_form():
+    """The banded solve must reproduce the textbook Gaussian posterior.
+
+    Everything else about this engine rests on the banded assembly being the
+    same matrix as the dense one, so it is checked directly rather than
+    inferred from the answer looking plausible.
+    """
+    rng = np.random.default_rng(0)
+    n, dt = 60, 0.002
+    w = wvl.ricker(30, 80, dt)
+    G = (inversion.convolution_matrix(w, n) @ inversion.difference_matrix(n)).toarray()
+    m_true = np.log(5e6) + np.cumsum(rng.normal(0, 0.02, n))
+    d = G @ m_true + rng.normal(0, 0.002, n)
+    m0 = np.full(n, np.log(5e6))
+
+    prior_std, smoothness, noise_pct = 0.09, 0.07, 12.0
+    sigma_d = float(np.sqrt(np.mean(d ** 2))) * noise_pct / 100.0
+
+    L = inversion.second_difference_matrix(n).toarray()
+    Q = (np.eye(n) + smoothness * (L.T @ L)) / prior_std ** 2
+    A = G.T @ G / sigma_d ** 2 + Q
+    rhs = G.T @ d / sigma_d ** 2 + m0 / prior_std ** 2
+    m_dense = np.linalg.solve(A, rhs)
+    var_dense = np.diag(np.linalg.inv(A))
+
+    res = inversion.bayesian_inversion(d, w, np.exp(m0), dt=dt, prior_std=prior_std,
+                                       smoothness=smoothness, noise_pct=noise_pct)
+    assert np.max(np.abs(res["log_impedance"] - m_dense)) < 1e-8
+    assert np.max(np.abs(res["posterior_std"] ** 2 - var_dense) / var_dense) < 1e-8
+
+
+def test_bayesian_beats_the_background_model():
+    vol, wells, ties, wav, lfm = build_case()
+    tie = ties[0]
+    lf = lfm.trace(tie.il_index, tie.xl_index)
+    res = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples, lf,
+                           method="bayesian", dt=vol.dt)
+    baseline = band_score(lf, tie.ai, vol.dt)
+    score = band_score(res["absolute_ai"], tie.ai, vol.dt)
+    assert score > baseline + 0.1, f"bayesian {score:.3f} vs background {baseline:.3f}"
+
+
+def test_bayesian_recovers_absolute_impedance_at_least_as_well_as_model_based():
+    """The point of the closed form is a better-calibrated answer, not just a faster one."""
+    vol, wells, ties, wav, lfm = build_case(n_wells=4)
+    def rmse(engine, **kw):
+        out = []
+        for tie in ties:
+            lf = lfm.trace(tie.il_index, tie.xl_index)
+            ai = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples, lf,
+                                  method=engine, dt=vol.dt, **kw)["absolute_ai"]
+            good = np.isfinite(tie.ai) & (tie.ai > 0) & np.isfinite(ai) & (ai > 0)
+            lw = np.log(utils.fill_nan_1d(np.where(good, tie.ai, np.nan)))
+            out.append(float(np.sqrt(np.mean((np.log(ai)[good] - lw[good]) ** 2))))
+        return float(np.mean(out))
+    bayes = rmse("bayesian", uncertainty=False)
+    mb = rmse("model-based", model_weight=0.1, max_iter=200)
+    assert bayes <= mb, f"bayesian log-AI RMSE {bayes:.4f} worse than model-based {mb:.4f}"
+
+
+def test_bayesian_posterior_lies_between_prior_and_data():
+    """Turning the noise up must walk the answer back to the prior, and down must fit."""
+    vol, wells, ties, wav, lfm = build_case(n_wells=3)
+    tie = ties[0]
+    lf = lfm.trace(tie.il_index, tie.xl_index)
+    trace = vol.trace_at(tie.il_index, tie.xl_index)
+
+    loud = inversion.invert(trace, wav.samples, lf, method="bayesian", dt=vol.dt,
+                            noise_pct=1e6, uncertainty=False)
+    assert np.max(np.abs(loud["log_impedance"] - loud["background_log_impedance"])) < 1e-3, \
+        "with the data all but ignored the posterior should collapse onto the prior mean"
+    assert loud["prior_drift"] < 1e-3
+
+    quiet = inversion.invert(trace, wav.samples, lf, method="bayesian", dt=vol.dt,
+                             noise_pct=1.0, uncertainty=False)
+    mid = inversion.invert(trace, wav.samples, lf, method="bayesian", dt=vol.dt,
+                           noise_pct=20.0, uncertainty=False)
+    assert quiet["misfit"] < mid["misfit"] < loud["misfit"], \
+        (quiet["misfit"], mid["misfit"], loud["misfit"])
+
+
+def test_bayesian_uncertainty_is_reduced_by_the_data():
+    vol, wells, ties, wav, lfm = build_case(n_wells=3)
+    tie = ties[0]
+    res = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples,
+                           lfm.trace(tie.il_index, tie.xl_index), method="bayesian",
+                           dt=vol.dt, prior_std=0.08)
+    std = res["posterior_std"]
+    assert np.all(std > 0)
+    assert np.all(std <= 0.08 + 1e-9), "the posterior can never be less certain than the prior"
+    assert 0.0 < res["uncertainty_reduction"] < 1.0
+    # Louder data assumptions must leave more uncertainty behind.
+    noisy = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples,
+                             lfm.trace(tie.il_index, tie.xl_index), method="bayesian",
+                             dt=vol.dt, prior_std=0.08, noise_pct=40.0)
+    assert np.mean(noisy["posterior_std"]) > np.mean(std)
+
+
+def test_bayesian_quantiles_bracket_the_mean():
+    vol, wells, ties, wav, lfm = build_case(n_wells=2)
+    tie = ties[0]
+    res = inversion.invert(vol.trace_at(tie.il_index, tie.xl_index), wav.samples,
+                           lfm.trace(tie.il_index, tie.xl_index), method="bayesian", dt=vol.dt)
+    assert np.all(res["ai_p10"] < res["absolute_ai"])
+    assert np.all(res["absolute_ai"] < res["ai_p90"])
+    assert np.all(res["ai_p10"] > 0), "log-normal quantiles must stay positive"
+
+
+def test_bayesian_requires_a_background_model():
+    vol, wells, ties, wav, lfm = build_case(n_wells=2)
+    try:
+        inversion.invert(vol.trace_at(0, 0), wav.samples, None, method="bayesian", dt=vol.dt)
+    except ValueError as exc:
+        assert "low-frequency" in str(exc)
+    else:
+        raise AssertionError("Bayesian inversion must refuse to run without a prior mean")
+
+
+def test_bayesian_volume_run_carries_the_uncertainty_cube():
+    vol, wells, ties, wav, lfm = build_case(n_wells=3)
+    res = inversion.run_volume(vol, "bayesian", wav.samples, lfm)
+    assert res.posterior_std is not None
+    assert res.posterior_std.shape == res.relative_ai.shape
+    assert np.all(res.posterior_std[np.isfinite(res.correlation)] > 0)
+    assert res.summary()["uncertainty"] == "yes"
+
+    off = inversion.run_volume(vol, "bayesian", wav.samples, lfm, uncertainty=False)
+    assert off.posterior_std is None
+    assert off.summary()["uncertainty"] == "no"
 
 
 def test_bulk_shift_is_not_cumulative():

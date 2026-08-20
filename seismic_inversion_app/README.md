@@ -76,8 +76,8 @@ background model fails.
 | **5 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
 | **6 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
 | **7 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
-| **8 - Inversion** | Method selection, method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
-| **9 - Results & export** | Section viewer, time slice, per-trace QC maps, crossplot against well logs, export. |
+| **8 - Inversion** | Four methods (coloured, sparse-spike, model-based, Bayesian), method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
+| **9 - Results & export** | Section viewer, time slice, per-trace QC maps, posterior uncertainty and P10/P90 where available, crossplot against well logs, export. |
 
 Step numbers are derived from one list in `app.py`, and every "see step N" in the
 help text is generated from it, so inserting a page cannot leave stale numbering
@@ -171,6 +171,55 @@ on the normal equations, whose bandwidth is set by the wavelet. That is roughly
 14× faster than the conjugate-gradient equivalent on the reweighted — and
 increasingly ill-conditioned — system, with identical results. Conjugate
 gradient and a sparse direct solve remain available via the `solver` argument.
+
+### 4. Bayesian linear inversion
+
+**What it does.** Treats the same linear problem probabilistically. With a
+linear operator, a Gaussian prior and Gaussian noise the posterior is Gaussian
+and available in closed form, so there is no iteration:
+
+```
+A     = G'G / sigma_d^2 + Q          posterior precision
+m     = A^-1 (G'd / sigma_d^2 + Q_amp m0)
+Cpost = A^-1
+```
+
+The prior `Q = (I + smoothness * L'L) / prior_std^2` says two things at once:
+log-impedance stays within `prior_std` of the background model, and its
+curvature is penalised. Both terms are banded, so the whole posterior solves in
+`O(n b^2)` — it is the *fastest* of the four engines despite being the only one
+that returns a distribution.
+
+**What you get back.** A posterior mean *and* a posterior standard deviation,
+and from those P10/P90 impedance volumes. Impedance is log-normal here, so the
+quantiles are exponentials of the Gaussian ones, not `mean ± k·sd`.
+
+**Assumptions.**
+- The forward problem is linear in log-impedance — true for the convolutional
+  model, and the reason a closed form exists at all.
+- Prior and noise are Gaussian. Real reflectivity is heavier-tailed than that;
+  sparse-spike exists precisely because of it.
+- `noise_pct` is an honest estimate. Set it too low and the posterior fits
+  noise, and the reported uncertainty will be too tight to believe. The
+  returned misfit should land near the noise level you claimed — if it lands
+  well below, the claim was wrong.
+
+**Limitations.**
+- The posterior mean is an MMSE estimate: deliberately conservative, and
+  shrunk toward the prior. It is not trying to be the sharpest-looking section.
+- The uncertainty is conditional on the prior, the wavelet and the background
+  model all being right. It measures how much the *data* constrained the answer
+  within those assumptions, not whether the assumptions hold.
+- Requires a low-frequency model, which serves as the prior mean.
+- Computing the posterior variance costs roughly 3× the mean alone (a banded
+  back-substitution per sample), and can be switched off.
+
+Measured against the four synthetic wells it recovers absolute impedance about
+as well as the model-based engine (log-impedance RMSE 0.068 against 0.069) at
+roughly half the runtime, and carries an uncertainty estimate the other engines
+cannot provide.
+
+---
 
 ### 3. Model-based inversion
 
@@ -446,6 +495,7 @@ on a single core:
 | Method | Time | Per trace | Notes |
 | --- | --- | --- | --- |
 | Coloured | 2.6 s | 1.6 ms | One convolution per trace |
+| Bayesian | 18.3 s | 5.5 ms | Closed form; 1.7 ms without the variance |
 | Sparse-spike | 31.8 s | 19.9 ms | 12 IRLS passes, banded Cholesky each |
 | Model-based | 43.6 s | 27.3 ms | L-BFGS-B, up to 60 iterations |
 

@@ -1511,13 +1511,14 @@ def page_inversion() -> None:
 
     gate = get_gate()
     method_label = st.radio(
-        "Method", ["Coloured", "Sparse-spike", "Model-based"], horizontal=True,
+        "Method", ["Coloured", "Sparse-spike", "Model-based", "Bayesian"], horizontal=True,
         captions=["Fast, wavelet-free, relative impedance",
                   "L1 deconvolution, sparse reflectivity",
-                  "Constrained fit to a background model"],
+                  "Constrained fit to a background model",
+                  "Closed-form posterior, with uncertainty"],
     )
     method = {"Coloured": "coloured", "Sparse-spike": "sparse-spike",
-              "Model-based": "model-based"}[method_label]
+              "Model-based": "model-based", "Bayesian": "bayesian"}[method_label]
 
     params: dict = {"merge_freq": 10.0}
     ready, blockers = True, []
@@ -1535,6 +1536,31 @@ def page_inversion() -> None:
             ready, blockers = False, blockers + ["a wavelet (" + step_ref("wavelet") + ")"]
         if model is None:
             st.info("Without a low-frequency model the output is relative impedance only.")
+    elif method == "bayesian":
+        st.caption("The only engine here that returns a distribution rather than a single answer: "
+                   "the posterior is Gaussian and available in closed form, so there is no "
+                   "iteration and a posterior standard deviation comes back with the mean.")
+        c1, c2, c3 = st.columns(3)
+        params["prior_std"] = c1.slider(
+            "Prior std (log-impedance)", 0.01, 0.50, 0.08, 0.01,
+            help="How far log-impedance may sit from the background model. 0.08 is roughly "
+                 "+/-8% in impedance.")
+        params["smoothness"] = c2.slider(
+            "Smoothness", 0.0, 1.0, 0.05, 0.01,
+            help="Curvature penalty relative to the amplitude term. Keep it small: only the "
+                 "amplitude term carries the background mean, so a large value pulls the "
+                 "prior mean off the background model.")
+        params["noise_pct"] = c3.slider(
+            "Noise level (% of trace RMS)", 1.0, 50.0, 10.0, 0.5,
+            help="Sets how hard the data may pull the answer off the prior. Too low and the "
+                 "posterior fits noise; the reported misfit should land near this value.")
+        params["uncertainty"] = st.checkbox(
+            "Compute posterior uncertainty", value=True,
+            help="Adds roughly 3x to the runtime and produces P10/P90 impedance volumes.")
+        if wav is None:
+            ready, blockers = False, blockers + ["a wavelet (" + step_ref("wavelet") + ")"]
+        if model is None:
+            ready, blockers = False, blockers + ["a low-frequency model (" + step_ref("lfm") + ")"]
     else:
         c1, c2, c3 = st.columns(3)
         params["model_weight"] = c1.slider("Model constraint weight", 0.0, 2.0, 0.10, 0.01,
@@ -1711,6 +1737,16 @@ def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -
                            f"{utils.normalised_correlation(res['absolute_ai'][sel], tie.ai[sel]):.3f}")
     if "iterations" in res:
         cols[3].metric("Iterations", res["iterations"])
+    elif "uncertainty_reduction" in res:
+        cols[3].metric("Uncertainty cut", f"{res['uncertainty_reduction'] * 100:.0f}%",
+                       help="How much the data reduced the prior standard deviation.")
+
+    if res.get("posterior_std") is not None:
+        st.caption(
+            f"Posterior std {np.mean(res['posterior_std']):.4f} in log-impedance "
+            f"(prior {res['prior_std']:.3f}); the answer sits at most "
+            f"{res['prior_drift']:.2f} log units from the background model."
+        )
 
 
 # ==========================================================================
@@ -1735,6 +1771,12 @@ def page_results() -> None:
         available = {"Absolute impedance": result.absolute_ai, **available}
     if result.method != "coloured":
         available["Residual"] = result.residual
+    if result.posterior_std is not None:
+        available["Posterior std (log AI)"] = result.posterior_std
+        z90 = 1.2815515655446004
+        if result.absolute_ai is not None:
+            available["Impedance P10"] = result.absolute_ai * np.exp(-z90 * result.posterior_std)
+            available["Impedance P90"] = result.absolute_ai * np.exp(z90 * result.posterior_std)
     if model is not None and not result.is_subset:
         available["Low-frequency model"] = model.ai
 
@@ -1743,6 +1785,10 @@ def page_results() -> None:
     which = st.selectbox("Attribute", list(available))
     cube = available[which]
     is_amplitude_like = which in ("Reflectivity", "Residual", "Relative impedance")
+    if which == "Posterior std (log AI)":
+        st.caption("Posterior standard deviation of log-impedance: low where the seismic "
+                   "constrains the answer, rising toward the trace ends and wherever the "
+                   "wavelet carries little energy.")
 
     sub_vol = _subset_volume(vol, result)
     orientation, index, axis_vals = _section_controls(sub_vol, key="res")
