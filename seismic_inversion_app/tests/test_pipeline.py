@@ -373,6 +373,87 @@ def test_curve_autodetection_across_unit_conventions():
         assert abs(rho - 2450) < 20, f"{label}: Rho {rho:.0f}"
 
 
+def _las_with_depth_unit(depth_unit: str, kb: float = 100.0):
+    """LAS whose index is 1000-1200 in *depth_unit*, with a KB in the same system."""
+    import io as _io
+
+    import lasio
+
+    las = lasio.LASFile()
+    las.well["WELL"] = lasio.HeaderItem("WELL", value="UNITS")
+    las.well["KB"] = lasio.HeaderItem("KB", value=kb)
+    dept = np.arange(1000.0, 1200.0, 0.5)
+    las.append_curve("DEPT", dept, unit=depth_unit)
+    las.append_curve("DT", np.full(dept.shape, 100.0), unit="us/ft")
+    las.append_curve("RHOB", np.full(dept.shape, 2.45), unit="g/cm3")
+    buf = _io.StringIO()
+    las.write(buf, version=2.0)
+    buf.seek(0)
+    return buf
+
+
+def test_depth_index_in_feet_is_converted_to_metres():
+    """A LAS indexed in feet must not land 3.28x too deep.
+
+    ``WellData.md`` is metres everywhere downstream -- ``integrate_sonic_to_twt``
+    divides it by a velocity in m/s -- so an unconverted foot index does not
+    fail loudly, it just puts the well far below where it belongs.
+    """
+    ft = data_io.load_las(_las_with_depth_unit("FT"), name="W")
+    m = data_io.load_las(_las_with_depth_unit("M"), name="W")
+    assert ft.depth_unit == "ft"
+    assert m.depth_unit == "m"
+    assert abs(ft.md[0] - 1000.0 / utils.FT_PER_M) < 1e-6, f"md {ft.md[0]}"
+    assert abs(ft.md[0] - m.md[0] / utils.FT_PER_M) < 1e-6
+    # KB is quoted in the same system as the index, so it converts with it.
+    assert abs(ft.kb - 100.0 / utils.FT_PER_M) < 1e-6, f"kb {ft.kb}"
+    assert any("feet" in n for n in ft.notes), ft.notes
+
+
+def test_foot_indexed_well_ties_at_the_same_time_as_its_metric_twin():
+    """The same well in feet and in metres must produce the same TWT."""
+    ft = data_io.load_las(_las_with_depth_unit("FT"), name="W")
+    m_ft = ft.md * utils.FT_PER_M          # back to the raw numbers in the file
+    metric = data_io.load_las(_las_with_depth_unit("M"), name="W")
+    # Same numbers on the page, different unit: the foot well is the shallower
+    # one, so its TWT must be smaller by very nearly the foot/metre ratio.
+    t_ft = float(np.nanmin(ft.twt))
+    t_m = float(np.nanmin(metric.twt))
+    assert t_ft < t_m, f"feet {t_ft:.1f} ms should be shallower than metres {t_m:.1f} ms"
+    assert abs(t_m / t_ft - utils.FT_PER_M) < 0.05, f"ratio {t_m / t_ft:.3f}"
+    assert abs(m_ft[0] - 1000.0) < 1e-6
+
+
+def test_unlabelled_depth_index_is_assumed_metres_and_flagged():
+    """Depth magnitude cannot separate feet from metres, so QC must say so.
+
+    Written by hand rather than through lasio, which substitutes ``M`` for a
+    blank index unit on write -- real files in the wild are not so tidy.
+    """
+    import io as _io
+
+    text = "\n".join([
+        "~Version", "VERS. 2.0 :", "WRAP. NO :",
+        "~Well", "WELL. NOWHERE :WELL", "NULL. -999.25 :NULL",
+        "~Curve",
+        "DEPT.      :1 Depth",          # <- no unit at all
+        "DT   .US/F :2 Sonic",
+        "RHOB .G/CC :3 Density",
+        "~Ascii",
+        "1000.0 100.0 2.45",
+        "1000.5 100.0 2.45",
+        "1001.0 100.0 2.45",
+        "1001.5 100.0 2.45",
+        "",
+    ])
+    well = data_io.load_las(_io.StringIO(text), name="W")
+    assert well.depth_unit == "", f"got {well.depth_unit!r}"
+    assert abs(well.md[0] - 1000.0) < 1e-6, "unlabelled must pass through untouched"
+    assert any("assumed metres" in n for n in well.notes), well.notes
+    flags = well.qc_flags()
+    assert any(lvl == "warning" and "assumed metres" in msg for lvl, msg in flags), flags
+
+
 def test_las_unit_string_beats_magnitude():
     """An explicit LAS unit must win over the magnitude heuristic."""
     well = data_io.load_las(_synthetic_las({"DT": 328.084, "RHOB": 2.45}, ["us/ft", "g/cm3"]), name="W")

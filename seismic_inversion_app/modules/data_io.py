@@ -275,6 +275,43 @@ def velocity_from_curve(values: np.ndarray, unit: str) -> np.ndarray:
     return out
 
 
+DEPTH_UNITS = ("m", "ft")
+
+
+def depth_unit_scale(unit: str) -> tuple[float, str]:
+    """Metres per unit of a LAS depth index, and the unit that was resolved.
+
+    ``WellData.md`` is metres everywhere downstream -- ``integrate_sonic_to_twt``
+    divides it by a velocity in m/s -- so a LAS indexed in feet has to be
+    converted on the way in.  Left unconverted it does not fail loudly; it just
+    puts the well 3.28x too deep, which is why this is decided from the header
+    rather than guessed from the numbers.  Depth magnitude cannot disambiguate
+    the two (a 4,000 m well and a 4,000 ft well are both ordinary), so an
+    unlabelled index is taken as metres and flagged in QC.
+    """
+    u = str(unit or "").strip().lower().rstrip(".")
+    if u in ("ft", "f", "feet", "foot", "ftus", "usft", "ft(us)"):
+        return 1.0 / utils.FT_PER_M, "ft"
+    if u in ("m", "metre", "meter", "metres", "meters", "md"):
+        return 1.0, "m"
+    return 1.0, ""
+
+
+def _depth_index_unit(las) -> str:
+    """The unit of the LAS depth index: the first curve, else ``STRT``."""
+    try:
+        if len(las.curves):
+            unit = str(getattr(las.curves[0], "unit", "") or "").strip()
+            if unit:
+                return unit
+    except Exception:  # noqa: BLE001 - malformed curve section
+        pass
+    for item in getattr(las, "well", []):
+        if item.mnemonic.upper() == "STRT":
+            return str(getattr(item, "unit", "") or "").strip()
+    return ""
+
+
 def time_curve_to_twt_ms(values: np.ndarray, unit: str) -> np.ndarray:
     """Normalise a time curve to two-way time in milliseconds."""
     values = np.asarray(values, dtype=float).copy()
@@ -423,6 +460,9 @@ class WellData:
     # the file rather than only what auto-detection picked.
     curve_units: dict[str, str] = field(default_factory=dict)
     curve_descr: dict[str, str] = field(default_factory=dict)
+    # Depth index unit as resolved on load ("m", "ft", or "" when unlabelled).
+    # ``md`` is always metres; this records what it was converted from.
+    depth_unit: str = ""
     selection: CurveSelection = field(default_factory=CurveSelection)
     # Auxiliary files: checkshot, deviation survey, formation tops.
     time_depth: TimeDepth | None = None
@@ -654,6 +694,12 @@ class WellData:
                                          f"{lo:,.0f}-{hi:,.0f} {unit}."))
             else:
                 flags.append(("ok", f"{name} median {med:,.0f} {unit} looks plausible."))
+
+        if self.depth_unit == "ft":
+            flags.append(("ok", "Depth index was in feet; converted to metres on load."))
+        elif not self.depth_unit:
+            flags.append(("warning", "Depth index carries no unit; assumed metres. If the LAS is "
+                                     "in feet the time-depth will be ~3.28x too deep."))
 
         _range_check("Vp", vp, *VP_RANGE, "m/s",
                      "A factor of ~3.28 means feet and metres are swapped; ~1000 means the unit is wrong.")
@@ -1138,7 +1184,9 @@ def load_las(
     else:
         las = lasio.read(path_or_buffer)
 
-    md = np.asarray(las.index, dtype=float)
+    raw_depth_unit = _depth_index_unit(las)
+    depth_scale, depth_unit = depth_unit_scale(raw_depth_unit)
+    md = np.asarray(las.index, dtype=float) * depth_scale
     curves: dict[str, np.ndarray] = {}
     units: dict[str, str] = {}
     descr: dict[str, str] = {}
@@ -1159,17 +1207,24 @@ def load_las(
         rho=np.full(md.shape, np.nan),
         x=_as_float(_header_value(las, ("XCOORD", "X", "SURFX", "EASTING", "LOCX"), None)),
         y=_as_float(_header_value(las, ("YCOORD", "Y", "SURFY", "NORTHING", "LOCY"), None)),
-        kb=float(_as_float(_header_value(las, ("KB", "EKB", "ELEV"), 0.0)) or 0.0),
+        kb=float(_as_float(_header_value(las, ("KB", "EKB", "ELEV"), 0.0)) or 0.0) * depth_scale,
         uwi=str(_header_value(las, ("UWI", "API", "WELL"), "") or ""),
         curves=curves,
         curve_units=units,
         curve_descr=descr,
+        depth_unit=depth_unit,
     )
 
     selection = autodetect_selection(curves, units, constant_vp=constant_vp,
                                      sonic_unit_hint=sonic_unit)
     well.apply_selection(selection, replacement_velocity=replacement_velocity,
                          seismic_datum=seismic_datum)
+    if depth_unit == "ft":
+        well.notes.append(f"Depth index read as feet ({raw_depth_unit}); converted to metres")
+    elif not depth_unit:
+        well.notes.append(
+            f"Depth index unit {raw_depth_unit or 'absent'} not recognised; assumed metres"
+        )
 
     if datum_twt:
         well.set_bulk_shift(float(datum_twt))
@@ -1985,6 +2040,7 @@ def make_synthetic_dataset(
             curve_units={"DEPT": "m", "DT": "us/ft", "RHOB": "g/cm3", "TWT": "ms"},
             curve_descr={"DEPT": "Measured depth", "DT": "Sonic slowness",
                          "RHOB": "Bulk density", "TWT": "Two-way time (already tied)"},
+            depth_unit="m",   # built in metres, so QC should not flag it as unlabelled
         )
         well.apply_selection(CurveSelection(
             sonic="DT", sonic_unit="us/ft",

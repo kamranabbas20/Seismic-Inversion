@@ -63,6 +63,78 @@ ran": every engine must recover more of the true band-limited impedance than
 the low-frequency model alone does. An inversion that merely reproduces its own
 background model fails.
 
+### Validation on real field data
+
+Synthetic tests can only prove the algebra is right. They cannot tell you
+whether the app survives a real well, because a synthetic well has a perfect
+time-depth relationship, a stationary wavelet and no drift.
+
+`scripts/validate_penobscot.py` runs the whole workflow against the Penobscot
+3D survey, offshore Nova Scotia — real seismic and a real well, both openly
+licensed, neither redistributed in this repository:
+
+```bash
+python scripts/validate_penobscot.py --fetch     # clone the public data
+python scripts/validate_penobscot.py --figure penobscot.png
+```
+
+- **Seismic** — crossline 1155 of the Penobscot 3D (601 traces, 4 ms). Owned by
+  the Nova Scotia Department of Energy, distributed by permission through dGB's
+  Open Seismic Repository, via the SEG tutorial repository `seg/tutorials-2014`.
+- **Well** — Penobscot L-30, Schlumberger logs digitised by Neil Watson and
+  released by CNSOPB for non-commercial knowledge sharing, from the same repo
+  (the data for Evan Bianco's *Leading Edge* tutorial "How to make a synthetic").
+
+L-30 sits 42 m off that line, which is what makes the pair usable. The script
+first checks its own reading of the LAS header against the three geometry
+numbers published in that tutorial, so the datum is verified against a third
+party rather than asserted:
+
+| | this app | SEG tutorial |
+|---|---|---|
+| KB elevation | 30.175 m | 30.175 m |
+| water column | 137.465 m | 137.46 m |
+| rock above the top of log | 179.832 m | 179.83 m |
+
+Scores at the well, 996–2836 ms (461 samples, the interval where the sonic and
+density logs overlap):
+
+| | corr 10–60 Hz | corr full band | RMSE ln(AI) | seismic residual |
+|---|---|---|---|---|
+| low-frequency model only | 0.319 | 0.942 | 0.0802 | — |
+| coloured | 0.337 | 0.942 | 0.0801 | — |
+| sparse-spike | 0.293 | 0.785 | 0.2107 | 0.5% |
+| model-based | 0.384 | 0.823 | 0.2003 | 20.4% |
+| **Bayesian** | **0.395** | 0.824 | 0.1938 | 14.3% |
+
+**Read the first column, not the second.** With one well the low-frequency
+model is built from the same log the result is scored against, so the full-band
+correlation is not a blind test — it mostly measures the background model, which
+is why "low-frequency model only" appears to win it. Above the model's 10 Hz
+cutoff the background carries no information, so the 10–60 Hz column is what the
+inversion actually recovered from the seismic. The seismic residual is blind
+everywhere: it is measured over all 601 traces without reference to the well.
+
+The method ranking matches the synthetic study — Bayesian best, then
+model-based — but the absolute numbers are much lower (0.40 against 0.56), and
+the reason is the well tie, not the engines. L-30 has no checkshot in the open
+release, so the time-depth comes from integrating the sonic; the resulting tie
+correlation is 0.45 and the estimated wavelet carries +74° of constant phase.
+Everything downstream inherits that.
+
+Two findings worth stating plainly:
+
+- **Sparse-spike scores *below* the background model** (0.293 against 0.319)
+  while fitting the seismic almost exactly (0.5% residual). That is the
+  signature of over-fitting: with a phase-rotated wavelet, driving the residual
+  to zero means fitting noise. On synthetic data, where the wavelet is exact,
+  the same engine beats the baseline. Sparse-spike is the method most sensitive
+  to tie quality, and this is what that looks like.
+- **A sonic-drift (stretch) correction is worth +0.045 of tie correlation** over
+  bulk shift alone. The app's tie step offers bulk shift only — deliberately, as
+  a v1 scope decision — so the script has to apply the stretch outside it. On
+  data without a checkshot that limitation costs real accuracy.
+
 ---
 
 ## Workflow
@@ -96,9 +168,9 @@ interest usually improves the wavelet.
 
 ---
 
-## The three inversion methods
+## The four inversion methods
 
-All three share one interface:
+All four share one interface:
 
 ```python
 invert(trace, wavelet, low_freq_trace=None, method=..., **params) -> dict
@@ -172,6 +244,36 @@ on the normal equations, whose bandwidth is set by the wavelet. That is roughly
 increasingly ill-conditioned — system, with identical results. Conjugate
 gradient and a sparse direct solve remain available via the `solver` argument.
 
+### 3. Model-based inversion
+
+**What it does.** Perturbs log-impedance until `wavelet * reflectivity(impedance)`
+matches the trace, regularised toward the background model (Russell & Hampson
+style). The objective
+
+```
+J(m) = ½‖C D m − s‖²  +  ½ μ‖m − m₀‖²  +  ½ η‖L m‖²
+```
+
+is quadratic in `m = ln(AI)`, so the analytic gradient is exact and L-BFGS-B
+converges in tens of iterations. A per-sample bound keeps the answer within a
+chosen departure from the background model.
+
+**Assumptions.**
+- The low-frequency model is right. This method is regularised *toward* it, so
+  a bad background model produces a confidently bad answer.
+- The wavelet is known, stationary and correctly scaled.
+- Impedance is smooth enough for the roughness penalty to be appropriate.
+
+**Limitations.**
+- **Requires** a low-frequency model; it will refuse to run without one.
+- The model-constraint weight trades data fit against departure from the
+  background. Raising it makes the result look more like the model you already
+  had — the inversion appears well-behaved precisely as it stops telling you
+  anything new. The crossplot QC at wells is the check that matters.
+- Non-uniqueness is not quantified. There is one answer, not a posterior.
+
+---
+
 ### 4. Bayesian linear inversion
 
 **What it does.** Treats the same linear problem probabilistically. With a
@@ -221,36 +323,6 @@ cannot provide.
 
 ---
 
-### 3. Model-based inversion
-
-**What it does.** Perturbs log-impedance until `wavelet * reflectivity(impedance)`
-matches the trace, regularised toward the background model (Russell & Hampson
-style). The objective
-
-```
-J(m) = ½‖C D m − s‖²  +  ½ μ‖m − m₀‖²  +  ½ η‖L m‖²
-```
-
-is quadratic in `m = ln(AI)`, so the analytic gradient is exact and L-BFGS-B
-converges in tens of iterations. A per-sample bound keeps the answer within a
-chosen departure from the background model.
-
-**Assumptions.**
-- The low-frequency model is right. This method is regularised *toward* it, so
-  a bad background model produces a confidently bad answer.
-- The wavelet is known, stationary and correctly scaled.
-- Impedance is smooth enough for the roughness penalty to be appropriate.
-
-**Limitations.**
-- **Requires** a low-frequency model; it will refuse to run without one.
-- The model-constraint weight trades data fit against departure from the
-  background. Raising it makes the result look more like the model you already
-  had — the inversion appears well-behaved precisely as it stops telling you
-  anything new. The crossplot QC at wells is the check that matters.
-- Non-uniqueness is not quantified. There is one answer, not a posterior.
-
----
-
 ## Why amplitude calibration matters
 
 Sparse-spike and model-based inversion both solve `W r = s` for `r`. If the
@@ -278,6 +350,18 @@ files carry velocity where you expect slowness. A sonic read as `us/m` when it
 is really `us/ft` scales Vp by 3.28; a density read as `g/cm3` when it is
 `kg/m3` is out by 1000. Either mistake produces impedance that is confidently,
 silently wrong.
+
+The *depth index* is the same trap one level up. `WellData.md` is metres
+everywhere downstream — `integrate_sonic_to_twt` divides it by a velocity in
+m/s — so a LAS indexed in feet has to be converted on the way in. Left alone it
+does not fail loudly; it just places the well 3.28× too deep. The index unit is
+read from the header (the first curve, falling back to `STRT`) and the KB
+elevation is converted with it, since it is quoted in the same system. Depth
+magnitude cannot disambiguate the two — a 4,000 m well and a 4,000 ft well are
+both ordinary — so an *unlabelled* index is taken as metres and flagged in QC
+rather than guessed at. This is the defect the Penobscot run above surfaced:
+L-30 is indexed in feet, and its KB now reads 30.175 m against the tutorial's
+published 30.175 m.
 
 **Step 2** exists to catch that before it propagates:
 
@@ -525,10 +609,12 @@ seismic_inversion_app/
 ├── modules/
 │   ├── data_io.py            # SEG-Y + LAS loading, containers, synthetic generator
 │   ├── wavelet.py            # parametric, statistical and well-based extraction
-│   ├── inversion.py          # the three engines, volume runner, crossplot QC
+│   ├── inversion.py          # the four engines, volume runner, crossplot QC
 │   ├── low_freq_model.py     # background impedance model
 │   ├── visualization.py      # plotly sections, spectra, tie QC, crossplots
 │   └── utils.py              # units, filtering, geometry, impedance algebra
+├── scripts/
+│   └── validate_penobscot.py # end-to-end run on real open field data
 └── tests/
     └── test_pipeline.py      # end-to-end checks on the synthetic dataset
 ```
