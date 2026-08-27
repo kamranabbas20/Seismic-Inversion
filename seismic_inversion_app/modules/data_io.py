@@ -456,6 +456,10 @@ class WellData:
     curves: dict[str, np.ndarray] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     bulk_shift: float = 0.0
+    # Piecewise-linear stretch/squeeze on top of the bulk shift: knot times on
+    # the unshifted axis, and the correction (ms) to add at each.
+    warp_knots: np.ndarray | None = None
+    warp_shifts: np.ndarray | None = None
     # Raw LAS metadata, kept so the log-QC step can show what is actually in
     # the file rather than only what auto-detection picked.
     curve_units: dict[str, str] = field(default_factory=dict)
@@ -479,16 +483,75 @@ class WellData:
         self._twt_base = self.twt.copy()
 
     def set_bulk_shift(self, milliseconds: float) -> None:
-        """Apply a constant time shift to the whole well (v1 tie adjustment).
+        """Apply a constant time shift to the whole well.
 
-        Stretch and squeeze are deliberately out of scope for v1 -- a bulk shift
-        can only fix a datum error, not a drifting time-depth relationship.
+        A bulk shift fixes a datum error.  It cannot fix a drifting time-depth
+        relationship -- that needs :meth:`set_time_warp`, which sits on top of
+        this one rather than replacing it.
         """
         self.bulk_shift = float(milliseconds)
-        self.twt = self._twt_base + float(milliseconds)
+        self._apply_time_model()
+
+    def set_time_warp(self, knots_ms, shifts_ms) -> None:
+        """Piecewise-linear stretch and squeeze, on top of the bulk shift.
+
+        ``knots_ms`` are times on the *unshifted* well axis and ``shifts_ms``
+        the correction to add at each one; between and beyond them the
+        correction is linear and constant respectively.  A single knot is
+        therefore just another bulk shift, and ``None`` clears the warp.
+
+        The result must stay monotonic -- time cannot run backwards -- so a
+        warp that would fold the log is rejected rather than quietly applied.
+        """
+        if knots_ms is None or np.size(knots_ms) == 0:
+            self.warp_knots = None
+            self.warp_shifts = None
+            self._apply_time_model()
+            return
+
+        knots = np.asarray(knots_ms, dtype=float).ravel()
+        shifts = np.asarray(shifts_ms, dtype=float).ravel()
+        if knots.size != shifts.size:
+            raise ValueError("warp knots and shifts must be the same length")
+        order = np.argsort(knots)
+        knots, shifts = knots[order], shifts[order]
+
+        candidate = self._warp_times(self._twt_base, knots, shifts)
+        finite = np.isfinite(candidate)
+        if finite.sum() > 1 and np.any(np.diff(candidate[finite]) <= 0):
+            raise ValueError(
+                "this stretch would make the well's time axis non-monotonic; "
+                "reduce the drift or use fewer knots")
+
+        self.warp_knots = knots
+        self.warp_shifts = shifts
+        self._apply_time_model()
+
+    def _warp_times(self, base: np.ndarray, knots=None, shifts=None) -> np.ndarray:
+        """Map times on the unshifted axis through bulk shift, then warp."""
+        base = np.asarray(base, dtype=float)
+        knots = self.warp_knots if knots is None else knots
+        shifts = self.warp_shifts if shifts is None else shifts
+        out = base + float(self.bulk_shift)
+        if knots is not None and np.size(knots):
+            out = out + np.interp(base, knots, shifts)
+        return out
+
+    def _apply_time_model(self) -> None:
+        self.twt = self._warp_times(self._twt_base)
         # Markers are picked in depth but displayed in time, so they move with
         # the well or they would point at the wrong reflector.
         self.refresh_marker_times()
+
+    @property
+    def has_warp(self) -> bool:
+        return self.warp_knots is not None and np.size(self.warp_knots) > 1
+
+    def drift_range_ms(self) -> tuple[float, float]:
+        """Smallest and largest warp correction, excluding the bulk shift."""
+        if not self.has_warp:
+            return (0.0, 0.0)
+        return (float(np.min(self.warp_shifts)), float(np.max(self.warp_shifts)))
 
     # -- curve assignment ------------------------------------------------
     def apply_selection(
@@ -536,7 +599,9 @@ class WellData:
             notes.append("TWT integrated from Vp (no time curve assigned)")
 
         self._twt_base = np.asarray(base, dtype=float)
-        self.twt = self._twt_base + float(self.bulk_shift)
+        # Re-applied rather than dropped: reassigning the time curve must not
+        # silently discard a shift or stretch the user set on the tie step.
+        self._apply_time_model()
         self.notes = notes
         return notes
 
@@ -629,7 +694,7 @@ class WellData:
             good = np.isfinite(self.md) & np.isfinite(self._twt_base)
             base = (np.interp(md, self.md[good], self._twt_base[good], left=np.nan, right=np.nan)
                     if good.sum() > 1 else np.full(md.shape, np.nan))
-        for marker, t in zip(self.markers, base + self.bulk_shift):
+        for marker, t in zip(self.markers, self._warp_times(base)):
             marker.twt = float(t) if np.isfinite(t) else None
 
     def markers_in_range(self, t_min: float, t_max: float) -> list:
@@ -1786,6 +1851,10 @@ class WellTie:
     ai: np.ndarray               # well AI on the seismic time axis
     twt: np.ndarray
     n_neighbours: int = 1
+    # Set when the trace was sampled down the borehole rather than at the
+    # surface location (see extract_well_traces_along_path).
+    followed_path: bool = False
+    path_step_out: float = 0.0
 
 
 def extract_well_traces(
@@ -1825,6 +1894,94 @@ def extract_well_traces(
                 n_neighbours=int(nb.indices.size),
             )
         )
+    return ties
+
+
+def extract_well_traces_along_path(
+    volume: SeismicVolume,
+    wells: Sequence[WellData],
+    k: int = 4,
+    power: float = 2.0,
+) -> list[WellTie]:
+    """Sample the seismic *down the borehole* rather than at the surface point.
+
+    A vertical well and its deviation survey are the same thing, so this falls
+    back to :func:`extract_well_traces` when a well has no track or the track is
+    vertical.  For a genuinely deviated well they are not the same thing at all:
+    a 1,000 m step-out puts the reservoir section tens of bins away from the
+    wellhead, and tying the logs to the surface trace ties them to the wrong
+    rock.
+
+    Each seismic sample time is handled separately.  The well's own time-depth
+    gives the measured depth at that time, the deviation survey gives the map
+    position at that depth, and the trace value is taken from there -- so the
+    "trace" that comes back is a composite, following the path of the borehole
+    through the cube.  Above and below the logged interval the path is held at
+    its shallowest and deepest known positions rather than extrapolated.
+    """
+    xy = volume.trace_xy()
+    live = volume.live_mask()
+    flat = volume.flat_data()
+    twt_axis = np.asarray(volume.twt, dtype=float)
+
+    ties: list[WellTie] = []
+    for w in wells:
+        if not w.has_location:
+            continue
+        track = getattr(w, "track", None)
+        if track is None or track.is_vertical:
+            ties.extend(extract_well_traces(volume, [w], k=k, power=power))
+            continue
+
+        good = np.isfinite(w.twt) & np.isfinite(w.md)
+        if good.sum() < 2:
+            ties.extend(extract_well_traces(volume, [w], k=k, power=power))
+            continue
+
+        # TWT -> MD needs a monotonic time axis to invert; sort and dedupe.
+        t_log, md_log = w.twt[good], w.md[good]
+        order = np.argsort(t_log)
+        t_log, md_log = t_log[order], md_log[order]
+        keep = np.concatenate(([True], np.diff(t_log) > 0))
+        t_log, md_log = t_log[keep], md_log[keep]
+        if t_log.size < 2:
+            ties.extend(extract_well_traces(volume, [w], k=k, power=power))
+            continue
+
+        md_at_t = np.interp(twt_axis, t_log, md_log, left=md_log[0], right=md_log[-1])
+        px, py = track.xy_at(md_at_t)
+
+        composite = np.zeros(twt_axis.size, dtype=float)
+        nearest_index = None
+        distances = []
+        # Positions repeat over long stretches, so cache by trace index.
+        cache: dict[tuple[float, float], utils.TraceNeighbourhood] = {}
+        for s in range(twt_axis.size):
+            key = (round(float(px[s]), 1), round(float(py[s]), 1))
+            nb = cache.get(key)
+            if nb is None:
+                nb = utils.nearest_live_traces(xy, key, k=k, live_mask=live, power=power)
+                cache[key] = nb
+            composite[s] = float(utils.blend_traces(flat[nb.indices, :], nb.weights)[s])
+            distances.append(nb.distances[0])
+            if s == twt_axis.size // 2:
+                nearest_index = nb.nearest_index
+        if nearest_index is None:
+            nearest_index = 0
+
+        i, j = volume.flat_to_ij(nearest_index)
+        tie = WellTie(
+            well=w.name, il_index=i, xl_index=j,
+            iline=int(volume.iline[i]), xline=int(volume.xline[j]),
+            distance=float(np.mean(distances)),
+            seismic=composite,
+            reflectivity=w.reflectivity_on_time_axis(twt_axis),
+            ai=w.ai_on_time_axis(twt_axis),
+            twt=twt_axis, n_neighbours=int(k),
+        )
+        tie.path_step_out = float(np.hypot(px - px[0], py - py[0]).max())
+        tie.followed_path = True
+        ties.append(tie)
     return ties
 
 

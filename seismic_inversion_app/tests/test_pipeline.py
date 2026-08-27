@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules import data_io, inversion, low_freq_model, utils  # noqa: E402
 from modules import visualization as viz  # noqa: E402
 from modules import wavelet as wvl  # noqa: E402
+from modules import crossval, rockphysics, welltie  # noqa: E402
 
 GATE = (60.0, 520.0)
 
@@ -1279,6 +1280,312 @@ def test_figures_build():
     ]
     assert all(len(f.data) > 0 for f in figures)
     assert len(viz.tie_score_table(ties, wav.samples, *GATE)) == len(ties)
+
+
+# ==========================================================================
+# Stretch and squeeze, blind validation, coupling, realisations, rock physics
+# ==========================================================================
+
+def _tied_dataset(seed: int = 0):
+    """Synthetic cube plus an amplitude-calibrated wavelet, as the app builds it."""
+    volume, wells = data_io.make_synthetic_dataset(seed=seed)
+    ties = data_io.extract_well_traces(volume, wells, k=4)
+    wav = wvl.multi_well_wavelet(ties, volume.dt, volume.twt, length_ms=120.0)
+    wav = wvl.calibrate_amplitude(wav, ties, volume.twt)
+    return volume, wells, ties, wav
+
+
+def test_time_warp_is_idempotent_and_monotonic():
+    """Re-applying a warp must land in the same place, never accumulate."""
+    _volume, wells = data_io.make_synthetic_dataset()
+    well = wells[0]
+    base = well._twt_base.copy()
+    knots = np.linspace(np.nanmin(base), np.nanmax(base), 4)
+    well.set_bulk_shift(10.0)
+    well.set_time_warp(knots, np.array([0.0, 4.0, -3.0, 2.0]))
+    first = well.twt.copy()
+    well.set_time_warp(knots, np.array([0.0, 4.0, -3.0, 2.0]))
+    assert np.allclose(first, well.twt, equal_nan=True), "warp accumulated on re-application"
+    finite = np.isfinite(well.twt)
+    assert np.all(np.diff(well.twt[finite]) > 0), "warp made time run backwards"
+    well.set_time_warp(None, None)
+    assert np.allclose(well.twt, base + 10.0, equal_nan=True), "clearing the warp left a residue"
+
+
+def test_time_warp_refuses_to_fold_the_log():
+    """A stretch steep enough to invert time must be rejected, not applied."""
+    _volume, wells = data_io.make_synthetic_dataset()
+    well = wells[0]
+    base = well._twt_base.copy()
+    span = float(np.nanmax(base) - np.nanmin(base))
+    knots = np.array([np.nanmin(base), np.nanmax(base)])
+    try:
+        well.set_time_warp(knots, np.array([0.0, -2.0 * span]))
+    except ValueError as exc:
+        assert "monotonic" in str(exc)
+    else:
+        raise AssertionError("a folding warp was accepted")
+
+
+def test_tie_optimiser_recovers_an_imposed_shift():
+    volume, wells, _ties, wav = _tied_dataset()
+    well = wells[0]
+    well.set_bulk_shift(24.0)                       # knock it out of time
+    solution = welltie.optimise_tie(well, volume, wav.samples, n_knots=3)
+    assert solution.correlation > solution.correlation_start + 0.2, solution.summary()
+    assert abs(well.bulk_shift) < 12.0, f"shift not recovered: {well.bulk_shift}"
+
+
+def test_bulk_shift_only_is_the_one_knot_case():
+    """n_knots <= 1 must leave no warp behind at all."""
+    volume, wells, _ties, wav = _tied_dataset()
+    well = wells[0]
+    solution = welltie.optimise_tie(well, volume, wav.samples, n_knots=1)
+    assert solution.n_knots == 0
+    assert not well.has_warp
+    assert solution.drift_gain == 0.0
+
+
+def test_stretch_never_scores_worse_than_the_bulk_shift():
+    """The optimiser must reject a stretch that does not help."""
+    volume, wells, _ties, wav = _tied_dataset()
+    for well in wells[:2]:
+        solution = welltie.optimise_tie(well, volume, wav.samples, n_knots=4)
+        assert solution.correlation >= solution.correlation_bulk_only - 1e-6, solution.summary()
+
+
+def test_selected_inverse_matches_the_dense_diagonal():
+    """The Takahashi recursion must equal diag(A^-1) to machine precision."""
+    from scipy.linalg import cho_solve_banded, cholesky_banded
+
+    n = 240
+    w = wvl.ricker(30.0, 120.0, 0.004)
+    _G, _GtG, ab_g = inversion._OPERATORS.banded_model(w, n)
+    ab = inversion._add_banded(ab_g * 50.0, inversion._prior_precision_banded(n, 0.08, 0.05))
+    factor = cholesky_banded(ab, lower=False, check_finite=False)
+    fast = inversion.selected_inverse_diagonal(factor)
+    dense = np.diag(cho_solve_banded((factor, False), np.eye(n), check_finite=False))
+    assert np.max(np.abs(fast - dense) / np.abs(dense)) < 1e-10
+
+
+def test_auto_sparsity_tracks_the_requested_noise_level():
+    """A looser noise target must choose a stronger sparsity weight."""
+    volume, _wells, _ties, wav = _tied_dataset()
+    traces = volume.flat_data()[:: 40]
+    tight = inversion.select_sparsity(traces, wav.samples, dt=volume.dt, noise_pct=5.0, max_traces=4)
+    loose = inversion.select_sparsity(traces, wav.samples, dt=volume.dt, noise_pct=20.0, max_traces=4)
+    assert loose["sparsity"] > tight["sparsity"], (tight, loose)
+
+
+def test_lateral_weight_zero_reproduces_the_independent_result():
+    """Coupling must be a strict generalisation: weight 0 changes nothing."""
+    volume, wells, _ties, wav = _tied_dataset()
+    model = low_freq_model.build_low_frequency_model(volume, wells, cutoff_hz=10.0)
+    coupled = inversion.coupled_bayesian_volume(volume, wav.samples, model,
+                                                lateral_weight=0.0, n_sweeps=1,
+                                                il_range=(0, 4), xl_range=(0, 4))
+    solo = inversion.run_volume(volume, "bayesian", wavelet=wav.samples, low_freq_model=model,
+                                il_range=(0, 4), xl_range=(0, 4), uncertainty=False)
+    assert np.allclose(coupled.absolute_ai, solo.absolute_ai, rtol=1e-4), \
+        "lateral weight 0 did not reproduce the 1D answer"
+
+
+def test_lateral_coupling_reduces_lateral_roughness():
+    volume, wells, _ties, wav = _tied_dataset()
+    model = low_freq_model.build_low_frequency_model(volume, wells, cutoff_hz=10.0)
+    kw = dict(il_range=(0, 8), xl_range=(0, 8), n_sweeps=2)
+    loose = inversion.coupled_bayesian_volume(volume, wav.samples, model, lateral_weight=0.0, **kw)
+    tight = inversion.coupled_bayesian_volume(volume, wav.samples, model, lateral_weight=2.0, **kw)
+
+    def roughness(cube):
+        return float(np.mean(np.abs(np.diff(np.log(np.clip(cube, 1.0, None)), axis=0))))
+
+    assert roughness(tight.absolute_ai) < roughness(loose.absolute_ai)
+
+
+def test_realisations_reproduce_the_analytic_posterior():
+    """Draws must have the mean and spread the closed form predicts."""
+    volume, wells, ties, wav = _tied_dataset()
+    model = low_freq_model.build_low_frequency_model(volume, wells, cutoff_hz=10.0)
+    tie = ties[0]
+    trace = volume.trace_at(tie.il_index, tie.xl_index)
+    lf = model.trace(tie.il_index, tie.xl_index)
+    point = inversion.bayesian_inversion(trace, wav.samples, lf)
+    draws = inversion.bayesian_realisations(trace, wav.samples, lf, n_realisations=250, seed=1)
+
+    spread = np.std(draws["log_impedance"], axis=0)
+    assert abs(spread.mean() - point["posterior_std"].mean()) < 0.1 * point["posterior_std"].mean()
+    centre = draws["log_impedance"].mean(axis=0)
+    assert np.max(np.abs(centre - point["log_impedance"])) < 0.5 * point["posterior_std"].max() + 1e-6
+    assert np.all(draws["p10"] <= draws["p90"])
+
+
+def test_blind_validation_beats_the_background_it_was_denied():
+    """Held-out wells must be predicted better than a background built without them."""
+    volume, wells, _ties, wav = _tied_dataset()
+    cv = crossval.leave_one_out(volume, wells, wav.samples, method="bayesian")
+    scored = [s for s in cv.scores if np.isfinite(s.corr_band)]
+    assert len(scored) == len(wells)
+    assert all(s.beat_background for s in scored), [s.row() for s in scored]
+
+
+def test_blind_validation_needs_more_than_one_well():
+    volume, wells, _ties, wav = _tied_dataset()
+    try:
+        crossval.leave_one_out(volume, wells[:1], wav.samples)
+    except ValueError as exc:
+        assert "two" in str(exc)
+    else:
+        raise AssertionError("a single-well 'blind' test was allowed")
+
+
+def test_property_transform_recovers_a_known_relation():
+    """A curve built as a function of impedance must be recovered by the fit."""
+    volume, wells, ties, _wav = _tied_dataset()
+    rng = np.random.default_rng(5)
+    slope, intercept = -0.030, 0.75
+    for well in wells:
+        ai = well.vp * well.rho
+        well.curves["PHIT"] = intercept + slope * np.log(np.clip(ai, 1.0, None)) \
+            + rng.normal(0.0, 0.004, ai.shape)
+        well.curve_units["PHIT"] = "v/v"
+    fit = rockphysics.fit_property(volume, wells, "PHIT", degree=1, ties=ties)
+    assert fit.r_squared > 0.5, fit.summary()
+    assert abs(fit.coefficients[0] - slope) < 0.4 * abs(slope), fit.coefficients
+
+
+def test_property_uncertainty_grows_when_the_inversion_is_uncertain():
+    """Adding the posterior must widen the property uncertainty, never narrow it."""
+    volume, wells, ties, _wav = _tied_dataset()
+    rng = np.random.default_rng(6)
+    for well in wells:
+        ai = well.vp * well.rho
+        well.curves["PHIT"] = 0.75 - 0.030 * np.log(np.clip(ai, 1.0, None)) \
+            + rng.normal(0.0, 0.004, ai.shape)
+        well.curve_units["PHIT"] = "v/v"
+    fit = rockphysics.fit_property(volume, wells, "PHIT", degree=1, ties=ties)
+
+    ai_cube = np.full((2, 2, 8), 6.0e6)
+    posterior = np.full_like(ai_cube, 0.05)
+    plain = rockphysics.apply_fit(ai_cube, fit)
+    withpost = rockphysics.apply_fit(ai_cube, fit, posterior_std=posterior)
+    assert np.all(withpost["sigma"] >= plain["sigma"])
+    assert np.mean(withpost["sigma"]) > np.mean(plain["sigma"])
+
+
+def test_probability_and_expected_thickness_are_consistent():
+    """A cut-off far below everything must give probability 1 and full thickness."""
+    prop = np.full((2, 2, 10), 0.25)
+    sigma = np.full_like(prop, 0.01)
+    certain = rockphysics.probability_above(prop, sigma, 0.05)
+    assert np.allclose(certain, 1.0, atol=1e-6)
+    thickness = rockphysics.expected_thickness(certain, dt_ms=4.0)
+    assert np.allclose(thickness, 40.0)
+    # A cut-off on the mean sits at probability 0.5 whatever the uncertainty.
+    even = rockphysics.probability_above(prop, sigma, 0.25)
+    assert np.allclose(even, 0.5, atol=1e-6)
+    assert np.allclose(rockphysics.probability_above(prop, sigma, 0.05, below=True), 0.0, atol=1e-6)
+
+
+def test_proportional_flattening_differs_from_a_single_datum():
+    """Two horizons must flatten thickness as well as structure."""
+    volume, wells = data_io.make_synthetic_dataset()
+    n_il, n_xl, _ = volume.data.shape
+    ii, jj = np.meshgrid(np.arange(n_il), np.arange(n_xl), indexing="ij")
+    shallow = 250.0 + 30.0 * np.sin(ii / 6.0)
+    deep = shallow + 180.0 + 60.0 * np.cos(jj / 5.0)      # thickness varies laterally
+    one = low_freq_model.build_low_frequency_model(volume, wells, horizons={"A": shallow})
+    two = low_freq_model.build_low_frequency_model(volume, wells,
+                                                   horizons={"B": deep, "A": shallow})
+    assert "proportionally flattened" in " ".join(two.notes)
+    assert "A, B" in " ".join(two.notes), "horizons were not sorted stratigraphically"
+    assert not np.allclose(one.ai, two.ai)
+    assert np.isfinite(two.ai).all() and (two.ai > 0).all()
+
+
+def test_borehole_path_matches_the_surface_trace_for_a_vertical_well():
+    """A vertical deviation survey must change nothing at all."""
+    volume, wells = data_io.make_synthetic_dataset()
+    well = wells[0]
+    md = np.linspace(0.0, 3000.0, 40)
+    well.track = data_io.WellTrack(md=md, x=np.full(md.shape, well.x),
+                                   y=np.full(md.shape, well.y), tvdss=md - 30.0)
+    straight = data_io.extract_well_traces(volume, [well], k=4)[0]
+    followed = data_io.extract_well_traces_along_path(volume, [well], k=4)[0]
+    assert np.allclose(straight.seismic, followed.seismic)
+    assert not followed.followed_path, "a vertical well should not be reported as path-followed"
+
+
+def test_borehole_path_moves_a_deviated_well():
+    volume, wells = data_io.make_synthetic_dataset()
+    well = wells[0]
+    md = np.linspace(0.0, 3000.0, 40)
+    step = np.clip((md - 200.0) / 2000.0, 0.0, 1.0) * 400.0
+    well.track = data_io.WellTrack(md=md, x=well.x + step,
+                                   y=np.full(md.shape, well.y), tvdss=md - 30.0)
+    straight = data_io.extract_well_traces(volume, [well], k=4)[0]
+    followed = data_io.extract_well_traces_along_path(volume, [well], k=4)[0]
+    assert followed.followed_path
+    assert followed.path_step_out > 0.0
+    assert not np.allclose(straight.seismic, followed.seismic)
+
+
+def test_inverse_q_filter_restores_what_forward_q_took():
+    """Inverse Q must improve a trace that has been attenuated, not degrade it."""
+    dt = 0.002
+    n = 1200
+    twt = np.arange(n) * dt * 1000.0
+    rng = np.random.default_rng(0)
+    reflectivity = rng.normal(size=n) * (rng.random(n) < 0.15)
+    trace = utils.convolve_same(reflectivity, wvl.ricker(30.0, 120.0, dt))
+
+    for q in (40.0, 80.0):
+        attenuated = wvl.apply_q_filter(trace, dt, twt, q, inverse=False)
+        restored = wvl.apply_q_filter(attenuated, dt, twt, q, inverse=True, gain_limit_db=20.0)
+        before = utils.normalised_correlation(attenuated, trace)
+        after = utils.normalised_correlation(restored, trace)
+        assert after > before, f"Q={q}: inverse filtering made it worse ({before:.3f} -> {after:.3f})"
+
+    # Absorption is cumulative with travel time: it must take high frequencies
+    # out of the deep section while leaving the shallow section alone.  The
+    # whole-trace spectrum is the wrong place to look -- it is dominated by the
+    # shallow part, which is barely attenuated.
+    def centroid(x):
+        freq, amp = utils.amplitude_spectrum(x, dt, pad=8192)
+        return float((freq * amp).sum() / amp.sum())
+
+    shallow = twt < 400.0
+    deep = twt > 1800.0
+    drops = []
+    for q in (40.0, 80.0, 150.0):
+        attenuated = wvl.apply_q_filter(trace, dt, twt, q, inverse=False)
+        assert abs(centroid(attenuated[shallow]) - centroid(trace[shallow])) < 1.0, \
+            f"Q={q} changed the shallow section, where there is almost no travel time yet"
+        drops.append(centroid(trace[deep]) - centroid(attenuated[deep]))
+    assert all(d > 0 for d in drops), f"absorption added high frequencies: {drops}"
+    assert drops[0] > drops[1] > drops[2], f"stronger absorption did not cost more: {drops}"
+
+
+def test_infinite_q_is_a_no_op():
+    dt = 0.002
+    n = 400
+    twt = np.arange(n) * dt * 1000.0
+    trace = np.random.default_rng(1).normal(size=n)
+    assert np.allclose(wvl.apply_q_filter(trace, dt, twt, float("inf")), trace)
+
+
+def test_non_stationary_wavelet_covers_every_time():
+    volume, _wells, ties, _wav = _tied_dataset()
+    nsw = wvl.time_varying_wavelet(ties, volume.dt, volume.twt, n_windows=3,
+                                   window_ms=300.0, length_ms=120.0)
+    assert nsw.wavelets.shape[0] == 3
+    assert np.allclose(nsw.at(nsw.centres_ms[0]), nsw.wavelets[0])
+    # Blending between centres must stay bounded by its neighbours.
+    mid = nsw.at(0.5 * (nsw.centres_ms[0] + nsw.centres_ms[1]))
+    pair = np.stack([nsw.wavelets[0], nsw.wavelets[1]])
+    assert np.all(mid <= pair.max(axis=0) + 1e-9) and np.all(mid >= pair.min(axis=0) - 1e-9)
+    assert np.isfinite(nsw.dominant_frequencies()).all()
+
 
 
 # --------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The three post-stack inversion engines, plus the volume runner.
+"""The four post-stack inversion engines, plus the volume runner.
 
 Every engine exposes the same trace-level signature::
 
@@ -600,6 +600,94 @@ def sparse_spike_inversion(
     )
 
 
+def select_sparsity(
+    traces: np.ndarray,
+    wavelet: np.ndarray,
+    dt: float = 0.002,
+    noise_pct: float = 10.0,
+    lo: float = 1e-5,
+    hi: float = 1e5,
+    n_bisect: int = 16,
+    max_traces: int = 12,
+    seed: int = 0,
+    **params,
+) -> dict:
+    """Choose the sparsity weight from the noise level, not from a slider.
+
+    Sparse-spike has no natural scale for ``sparsity``: too small and it fits
+    the noise, too large and it returns nothing.  On real data that is not a
+    cosmetic choice.  Tested against Penobscot L-30, an under-regularised run
+    drove the seismic residual to 0.5% -- an almost exact fit -- and scored
+    *below* the background model at the well, because everything it added above
+    the background was noise.
+
+    Morozov's discrepancy principle gives the missing scale: stop fitting when
+    the residual is as large as the noise is believed to be, and no further.
+    ``noise_pct`` is the noise standard deviation as a percentage of trace RMS,
+    the same convention the Bayesian engine uses.  The residual grows
+    monotonically with ``sparsity``, so a bisection in log-space finds the
+    crossing in a dozen solves.
+
+    The search runs on a sample of traces rather than all of them: the answer
+    is a property of the wavelet and the noise level, not of one trace.
+
+    The bracket spans ten decades on purpose.  IRLS renormalises its weights to
+    unit mean each pass, which is what keeps ``sparsity`` meaning the same thing
+    from the first iteration to the last, but it also flattens the response: on
+    the synthetic case the residual moves only from 0.7% to 6.6% between
+    ``1e-5`` and ``5``, and needs ``1e5`` before it approaches the trace energy.
+    A bracket sized by intuition rather than measurement silently returns its
+    own endpoint.
+    """
+    traces = np.atleast_2d(np.asarray(traces, dtype=float))
+    if traces.shape[0] > max_traces:
+        rng = np.random.default_rng(seed)
+        keep = rng.choice(traces.shape[0], size=max_traces, replace=False)
+        traces = traces[keep]
+    live = traces[np.any(np.abs(traces) > 0, axis=1)]
+    if live.size == 0:
+        return {"sparsity": float(lo), "note": "no live traces; sparsity left at the floor"}
+
+    target = float(noise_pct) / 100.0
+    params = {k: v for k, v in params.items() if k not in ("sparsity", "low_freq_trace")}
+
+    def misfit(value: float) -> float:
+        got = []
+        for tr in live:
+            out = sparse_spike_inversion(tr, wavelet, None, dt=dt, sparsity=value, **params)
+            got.append(out["misfit"])
+        return float(np.nanmean(got))
+
+    lo_f, hi_f = float(lo), float(hi)
+    m_lo, m_hi = misfit(lo_f), misfit(hi_f)
+    evaluations = 2
+    if m_lo > target:
+        return {"sparsity": lo_f, "achieved_pct": m_lo * 100.0, "target_pct": target * 100.0,
+                "evaluations": evaluations,
+                "note": "even the weakest regularisation leaves more residual than the stated "
+                        "noise; the wavelet or the tie is the limit, not the sparsity"}
+    if m_hi < target:
+        return {"sparsity": hi_f, "achieved_pct": m_hi * 100.0, "target_pct": target * 100.0,
+                "evaluations": evaluations,
+                "note": "even the strongest regularisation fits closer than the stated noise"}
+
+    for _ in range(int(n_bisect)):
+        mid = float(np.sqrt(lo_f * hi_f))         # geometric bisection
+        m_mid = misfit(mid)
+        evaluations += 1
+        if m_mid < target:
+            lo_f = mid
+        else:
+            hi_f = mid
+        if abs(m_mid - target) < 0.002:
+            break
+    chosen = float(np.sqrt(lo_f * hi_f))
+    return {"sparsity": chosen, "achieved_pct": misfit(chosen) * 100.0,
+            "target_pct": target * 100.0, "evaluations": evaluations + 1,
+            "traces_used": int(live.shape[0]),
+            "note": "chosen by the discrepancy principle: residual matched to the noise level"}
+
+
 def _sparsity_ratio(r: np.ndarray) -> float:
     """Effective fraction of samples carrying energy, via the L1/L2 ratio.
 
@@ -812,10 +900,10 @@ def bayesian_inversion(
 
     posterior_std = None
     if uncertainty:
-        # diag(A^-1) by back-substituting against the identity; the
-        # factorisation is already done, so this is n banded solves.
-        cov = cho_solve_banded((factor, False), np.eye(n), check_finite=False)
-        posterior_std = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        # diag(A^-1) via the Takahashi recursion: O(n b^2) rather than the
+        # O(n^2 b) flops and O(n^2) memory of back-substituting against a full
+        # identity, which is what makes long traces affordable.
+        posterior_std = np.sqrt(np.clip(selected_inverse_diagonal(factor), 0.0, None))
 
     reflectivity = np.asarray(_OPERATORS.get(w, n)[1] @ m, dtype=float)
     synthetic = np.asarray(G @ m, dtype=float)
@@ -845,6 +933,293 @@ def bayesian_inversion(
         out["uncertainty_reduction"] = float(
             1.0 - np.mean(posterior_std) / max(float(prior_std), 1e-12))
     return out
+
+
+def selected_inverse_diagonal(factor: np.ndarray) -> np.ndarray:
+    """``diag(A^-1)`` from the banded Cholesky factor of ``A``, without forming it.
+
+    The obvious way to get the posterior variance is to back-substitute against
+    the identity, but that computes all ``n^2`` entries of the inverse to keep
+    ``n`` of them: it costs ``O(n^2 b)`` flops and ``O(n^2)`` memory, so it goes
+    quadratic exactly when traces get long.  Measured on a 31-band system it
+    took 16 ms at n=701 and 180 ms at n=1501.
+
+    The Takahashi recursion computes only the entries of the inverse that lie
+    inside the factor's band, which is ``O(n b^2)``.  Writing ``A = U' U`` with
+    ``U`` upper triangular, ``U * Sigma`` equals ``U'^-1``, which is zero above
+    the diagonal and ``1/U_ii`` on it, so for ``j >= i``::
+
+        Sigma_ij = ( [i == j] / U_ii  -  sum_{k>i} U_ik Sigma_kj ) / U_ii
+
+    Rows are filled from the bottom up, and every ``Sigma_kj`` the sum needs is
+    already known (using symmetry where ``k > j``).  The band of ``Sigma`` is
+    carried as a small dense sliding window so each row costs one matrix-vector
+    product rather than ``b`` dot products -- without that the Python loop
+    overhead cancels the flop saving.
+
+    ``factor`` is scipy's upper banded form, as returned by ``cholesky_banded``.
+    """
+    factor = np.asarray(factor, dtype=float)
+    b = factor.shape[0] - 1
+    n = factor.shape[1]
+    diag_u = factor[b, :]
+    if b == 0:
+        return 1.0 / np.square(diag_u)
+
+    # window[a, c] = Sigma[i + 1 + a, i + 1 + c] as row i is being computed.
+    # Entries that would index past the last sample stay zero; the matching
+    # U values are zero too, so they never reach a live result.
+    window = np.zeros((b, b))
+    out = np.empty(n)
+    u = np.zeros(b)
+
+    for i in range(n - 1, -1, -1):
+        u[:] = 0.0
+        k_max = min(i + b, n - 1)
+        m = k_max - i
+        if m > 0:
+            ks = np.arange(i + 1, k_max + 1)
+            u[:m] = factor[b + i - ks, ks]
+
+        row = np.empty(b + 1)                 # row[c] = Sigma[i, i + c]
+        row[1:] = -(u @ window) / diag_u[i] if m > 0 else 0.0
+        row[0] = (1.0 / diag_u[i] - float(u @ row[1:])) / diag_u[i]
+        out[i] = row[0]
+
+        nxt = np.empty((b, b))
+        nxt[0, :] = row[:b]
+        nxt[1:, 0] = row[1:b]
+        nxt[1:, 1:] = window[:b - 1, :b - 1]
+        window = nxt
+
+    return out
+
+
+def bayesian_realisations(
+    trace: np.ndarray,
+    wavelet: np.ndarray,
+    low_freq_trace: np.ndarray,
+    n_realisations: int = 20,
+    seed: int = 0,
+    dt: float = 0.002,
+    prior_std: float = 0.08,
+    smoothness: float = 0.05,
+    noise_pct: float = 10.0,
+    **_ignored,
+) -> dict:
+    """Draw equiprobable impedance realisations from the Bayesian posterior.
+
+    The point estimate is the posterior *mean*: smooth, band-limited, and by
+    construction the one answer no realisation actually looks like.  Sampling
+    the same posterior gives models that are all consistent with the seismic
+    and the prior, and whose spread *is* the uncertainty -- which is what you
+    want before quoting a thickness, a contact, or a volume.
+
+    Sampling is almost free once the factorisation exists.  With ``A = U' U``
+    and ``z`` standard normal, ``U^-1 z`` has covariance ``U^-1 U'^-1 = A^-1``,
+    so each realisation is one banded triangular solve::
+
+        m_sample = m_map + solve(U, z)
+
+    No Gibbs sampler, no burn-in, no convergence to argue about: these are
+    independent exact draws, because the posterior really is Gaussian.
+    """
+    from scipy.linalg import cho_solve_banded, cholesky_banded, solve_banded
+
+    trace = np.nan_to_num(np.asarray(trace, dtype=float))
+    w = np.nan_to_num(np.asarray(wavelet, dtype=float))
+    n = trace.size
+    lf = np.asarray(low_freq_trace, dtype=float)
+    if lf.size != n:
+        raise ValueError(f"low-frequency trace length {lf.size} does not match the trace ({n})")
+    lf = utils.fill_nan_1d(np.where(np.isfinite(lf) & (lf > 0), lf, np.nan))
+    if not np.isfinite(lf).all():
+        raise ValueError("low-frequency model trace has no valid samples")
+    m0 = np.log(lf)
+
+    G, _GtG, ab_G = _OPERATORS.banded_model(w, n)
+    rms = float(np.sqrt(np.mean(trace ** 2)))
+    sigma_d = max(rms * float(noise_pct) / 100.0, 1e-12)
+    inv_var_d = 1.0 / sigma_d ** 2
+
+    Q = _prior_precision_banded(n, prior_std, smoothness)
+    ab = _add_banded(ab_G * inv_var_d, Q)
+    rhs = (G.T @ trace) * inv_var_d + m0 / max(float(prior_std), 1e-9) ** 2
+
+    factor = cholesky_banded(ab, lower=False, check_finite=False)
+    m_map = cho_solve_banded((factor, False), rhs, check_finite=False)
+
+    b = factor.shape[0] - 1
+    rng = np.random.default_rng(seed)
+    draws = np.empty((int(n_realisations), n), dtype=np.float32)
+    for k in range(int(n_realisations)):
+        z = rng.standard_normal(n)
+        draws[k] = m_map + solve_banded((0, b), factor, z, check_finite=False)
+
+    ai = np.exp(draws.astype(float))
+    return {
+        "method": "bayesian-realisations",
+        "log_impedance": draws,
+        "absolute_ai": ai,
+        "mean_ai": np.exp(m_map),
+        "p10": np.percentile(ai, 10, axis=0),
+        "p50": np.percentile(ai, 50, axis=0),
+        "p90": np.percentile(ai, 90, axis=0),
+        "spread": float(np.mean(np.std(draws, axis=0))),
+        "n_realisations": int(n_realisations),
+        "noise_std": sigma_d,
+    }
+
+
+def coupled_bayesian_volume(
+    volume,
+    wavelet: np.ndarray,
+    low_freq_model,
+    lateral_weight: float = 0.5,
+    n_sweeps: int = 3,
+    il_range: tuple[int, int] | None = None,
+    xl_range: tuple[int, int] | None = None,
+    progress: Callable[[float, str], None] | None = None,
+    skip_dead: bool = True,
+    uncertainty: bool = False,
+    **params,
+) -> InversionResult:
+    """Bayesian inversion with the traces solved *together*, not one by one.
+
+    Every other engine here treats each trace as an independent 1D problem, so
+    nothing stops two neighbouring traces disagreeing by more than the seismic
+    can justify.  That is what vertical striping in a noisy inverted section
+    actually is: independent estimation errors, side by side.
+
+    The fix is a prior that knows the traces are neighbours.  Adding a lateral
+    roughness term to the joint precision gives::
+
+        A_total = blockdiag(A_i) + lambda_lat * (Laplacian_lateral kron I)
+
+    which is far too large to factor directly -- it is (traces x samples)
+    square.  But it is block-sparse, so a block Gauss-Seidel sweep solves it
+    one trace at a time using the *current* estimate of that trace's
+    neighbours::
+
+        (A_i + lambda_lat * deg_i I) m_i = rhs_i + lambda_lat * sum_j m_j
+
+    Each block solve is the same banded Cholesky as the 1D engine, so a run
+    costs ``n_sweeps`` times the 1D run and converges monotonically: the sweep
+    is coordinate descent on a convex quadratic.
+
+    ``lateral_weight`` is relative to the prior precision, so 0 reproduces the
+    independent 1D result exactly and larger values buy lateral continuity at
+    the price of resolution.
+    """
+    from scipy.linalg import cho_solve_banded, cholesky_banded
+
+    n_il, n_xl, n_t = volume.data.shape
+    il_sl = slice(*il_range) if il_range else slice(0, n_il)
+    xl_sl = slice(*xl_range) if xl_range else slice(0, n_xl)
+    sub = np.asarray(volume.data[il_sl, xl_sl, :], dtype=float)
+    s_il, s_xl = sub.shape[0], sub.shape[1]
+    if low_freq_model is None:
+        raise ValueError("spatially-coupled inversion requires a low-frequency model")
+    lf_cube = np.asarray(low_freq_model.ai[il_sl, xl_sl, :], dtype=float)
+    if lf_cube.shape != sub.shape:
+        raise ValueError("low-frequency model does not match the seismic geometry")
+
+    prior_std = float(params.get("prior_std", 0.08))
+    smoothness = float(params.get("smoothness", 0.05))
+    noise_pct = float(params.get("noise_pct", 10.0))
+    dt = float(params.get("dt", volume.dt))
+
+    w = np.nan_to_num(np.asarray(wavelet, dtype=float))
+    G, _GtG, ab_G = _OPERATORS.banded_model(w, n_t)
+    Q = _prior_precision_banded(n_t, prior_std, smoothness)
+
+    live = np.max(np.abs(sub), axis=2) > 0 if skip_dead else np.ones((s_il, s_xl), bool)
+    lf_safe = np.where(np.isfinite(lf_cube) & (lf_cube > 0), lf_cube, np.nan)
+    m0 = np.log(np.where(np.isfinite(lf_safe), lf_safe, np.nanmean(lf_safe)))
+    m = m0.copy()
+
+    # Per-trace data terms are fixed across sweeps; only the neighbour term moves.
+    inv_var = np.zeros((s_il, s_xl))
+    rhs0 = np.zeros((s_il, s_xl, n_t))
+    for i in range(s_il):
+        for j in range(s_xl):
+            if not live[i, j]:
+                continue
+            rms = float(np.sqrt(np.mean(sub[i, j] ** 2)))
+            sigma_d = max(rms * noise_pct / 100.0, 1e-12)
+            inv_var[i, j] = 1.0 / sigma_d ** 2
+            rhs0[i, j] = (G.T @ sub[i, j]) * inv_var[i, j] + m0[i, j] / max(prior_std, 1e-9) ** 2
+
+    # Scale the lateral weight to the prior precision so it is dimensionless.
+    lam = float(lateral_weight) / max(prior_std, 1e-9) ** 2
+    start = time.time()
+    total = max(int(n_sweeps), 1) * s_il * s_xl
+    done = 0
+    for sweep in range(max(int(n_sweeps), 1)):
+        for i in range(s_il):
+            for j in range(s_xl):
+                done += 1
+                if not live[i, j]:
+                    continue
+                neighbours = []
+                for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    a, b_ = i + di, j + dj
+                    if 0 <= a < s_il and 0 <= b_ < s_xl and live[a, b_]:
+                        neighbours.append(m[a, b_])
+                deg = len(neighbours)
+                ab = _add_banded(ab_G * inv_var[i, j], Q)
+                rhs = rhs0[i, j].copy()
+                if deg and lam > 0:
+                    ab[-1, :] += lam * deg
+                    rhs += lam * np.sum(neighbours, axis=0)
+                try:
+                    factor = cholesky_banded(ab, lower=False, check_finite=False)
+                    m[i, j] = cho_solve_banded((factor, False), rhs, check_finite=False)
+                except Exception:  # noqa: BLE001 - keep the previous estimate
+                    pass
+            if progress is not None:
+                progress(done / total, f"sweep {sweep + 1}/{n_sweeps}")
+
+    # Assemble the same outputs the 1D path produces.
+    _C, D, _CD = _OPERATORS.get(w, n_t)
+    rel = np.zeros((s_il, s_xl, n_t), dtype=np.float32)
+    refl = np.zeros_like(rel)
+    resid = np.zeros_like(rel)
+    absolute = np.zeros_like(rel)
+    misfit = np.full((s_il, s_xl), np.nan, dtype=np.float32)
+    corr = np.full((s_il, s_xl), np.nan, dtype=np.float32)
+    posterior = np.zeros_like(rel) if uncertainty else None
+    for i in range(s_il):
+        for j in range(s_xl):
+            if not live[i, j]:
+                continue
+            mij = m[i, j]
+            synthetic = np.asarray(G @ mij, dtype=float)
+            rel[i, j] = mij - float(np.mean(mij))
+            refl[i, j] = np.asarray(D @ mij, dtype=float)
+            resid[i, j] = sub[i, j] - synthetic
+            absolute[i, j] = np.exp(mij)
+            qc = _qc(sub[i, j], synthetic)
+            misfit[i, j] = qc["misfit"]
+            corr[i, j] = qc["correlation"]
+            if posterior is not None:
+                ab = _add_banded(ab_G * inv_var[i, j], Q)
+                ab[-1, :] += lam * 4
+                factor = cholesky_banded(ab, lower=False, check_finite=False)
+                posterior[i, j] = np.sqrt(np.clip(selected_inverse_diagonal(factor), 0.0, None))
+
+    if progress is not None:
+        progress(1.0, "coupled run complete")
+    out_params = dict(params)
+    out_params.update({"lateral_weight": lateral_weight, "n_sweeps": n_sweeps,
+                       "dt": dt, "uncertainty": uncertainty})
+    return InversionResult(
+        method="bayesian", relative_ai=rel, absolute_ai=absolute, reflectivity=refl,
+        residual=resid, misfit=misfit, correlation=corr, twt=volume.twt,
+        posterior_std=posterior, il_slice=il_sl, xl_slice=xl_sl, params=out_params,
+        elapsed_s=time.time() - start,
+        is_subset=(il_sl != slice(0, n_il) or xl_sl != slice(0, n_xl)),
+    )
 
 
 def _banded_matvec(ab: np.ndarray, x: np.ndarray) -> np.ndarray:

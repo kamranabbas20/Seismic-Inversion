@@ -52,7 +52,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules import data_io, inversion, low_freq_model as lfmod, utils, wavelet as wv  # noqa: E402
+from modules import (data_io, inversion, low_freq_model as lfmod, utils,  # noqa: E402
+                     wavelet as wv, welltie)
 
 REPOS = {"seg/tutorials-2014": "tutorials-2014"}
 SEISMIC = "tutorials-2014/1410_Phase/data/penobscot_xl1155.sgy"
@@ -194,31 +195,20 @@ def main() -> int:
     print(f"  closest trace is {best_d:.1f} m away")
 
     head("4. WELL TIE  --  bulk shift, then bulk shift + sonic drift")
-    base = well._twt_base.copy()
-    t_ref = float(np.nanmin(base))
-    probe = wv.ricker(25.0, 120.0, dt)   # fixed, so the tie cannot hide inside the wavelet
-
-    def place(t0: float, alpha: float):
-        well.twt = well._twt_base = t_ref + t0 + alpha * (base - t_ref)
-        return data_io.extract_well_traces(vol, [well], k=4)[0]
-
-    def score(tie, gate):
-        syn = utils.convolve_same(np.nan_to_num(tie.reflectivity), probe)
-        return utils.normalised_correlation(syn[gate], tie.seismic[gate])
-
-    # Broad gate for the tie search, from the well as first placed; the final
-    # gate is re-derived from the tied well below.
-    _ai0 = well.ai_on_time_axis(twt)
-    wide = np.isfinite(_ai0) & (_ai0 > 0)
-    shift_only = max(((score(place(t0, 1.0), wide), t0) for t0 in np.arange(-60, 61, 4.0)))
-    best = max(((score(place(t0, al), wide), t0, al)
-                for t0 in np.arange(shift_only[1] - 30, shift_only[1] + 31, 2.0)
-                for al in np.arange(0.86, 1.15, 0.01)))
-    tie = place(best[1], best[2])
-    print(f"  bulk shift only         corr {shift_only[0]:+.3f}  ({shift_only[1]:+.0f} ms)")
-    print(f"  + sonic-drift stretch   corr {best[0]:+.3f}  ({best[1]:+.0f} ms, {best[2]:.3f}x)")
-    print(f"  drift correction is worth {best[0] - shift_only[0]:+.3f}; the app's tie step offers")
-    print("  bulk shift only, so this had to be done outside it.")
+    # The app's own optimiser, not a bespoke search: this is what the tie step
+    # runs.  The wavelet is held fixed while the warp is searched.
+    probe = wv.ricker(25.0, 120.0, dt)
+    bulk_only = welltie.optimise_tie(well, vol, probe, n_knots=1,
+                                     max_shift_ms=60.0, k_neighbours=4)
+    stretched = welltie.optimise_tie(well, vol, probe, n_knots=5, max_shift_ms=60.0,
+                                     max_drift_ms=30.0, k_neighbours=4)
+    print(f"  bulk shift only         corr {bulk_only.correlation:+.3f}  "
+          f"({bulk_only.bulk_shift:+.0f} ms)")
+    print(f"  + sonic-drift stretch   corr {stretched.correlation:+.3f}  "
+          f"({stretched.bulk_shift:+.0f} ms, {stretched.n_knots} knots, "
+          f"drift {well.drift_range_ms()[0]:+.0f} to {well.drift_range_ms()[1]:+.0f} ms)")
+    print(f"  the stretch is worth {stretched.drift_gain:+.3f} of tie correlation")
+    tie = data_io.extract_well_traces(vol, [well], k=4)[0]
 
     # Gate: where the *tied* well has Vp and density together.
     ok = np.isfinite(tie.ai) & (tie.ai > 0)
@@ -242,10 +232,20 @@ def main() -> int:
           f"colour operator beta {op.exponent:+.3f}, scalar {op.scalar:.4g}")
 
     head(f"6. INVERTING THE REAL LINE  ({vol.data.shape[0]} traces x {twt.size} samples)")
+    # Sparse-spike has no natural scale for its sparsity weight, so pick it from
+    # the noise level rather than leaving a slider at its default.
+    live = vol.flat_data()[vol.live_mask()]
+    picked = inversion.select_sparsity(live, wave.samples, dt=dt, noise_pct=10.0)
+    print(f"  sparse-spike sparsity chosen automatically: {picked['sparsity']:.4g} "
+          f"(residual {picked.get('achieved_pct', float('nan')):.1f}% against a "
+          f"{picked.get('target_pct', 0):.1f}% target)")
+
     res = {}
     for method in inversion.METHODS:
         started = time.time()
         extra = {"operator": op} if method == "coloured" else {}
+        if method == "sparse-spike":
+            extra["sparsity"] = picked["sparsity"]
         res[method] = inversion.run_volume(vol, method, wavelet=wave.samples,
                                            low_freq_model=lf, **extra)
         el = time.time() - started

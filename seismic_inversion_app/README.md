@@ -101,11 +101,11 @@ density logs overlap):
 
 | | corr 10–60 Hz | corr full band | RMSE ln(AI) | seismic residual |
 |---|---|---|---|---|
-| low-frequency model only | 0.319 | 0.942 | 0.0802 | — |
-| coloured | 0.337 | 0.942 | 0.0801 | — |
-| sparse-spike | 0.293 | 0.785 | 0.2107 | 0.5% |
-| model-based | 0.384 | 0.823 | 0.2003 | 20.4% |
-| **Bayesian** | **0.395** | 0.824 | 0.1938 | 14.3% |
+| low-frequency model only | 0.333 | 0.942 | 0.0795 | — |
+| coloured | 0.490 | 0.948 | 0.0748 | — |
+| sparse-spike | 0.374 | 0.872 | 0.1441 | 10.1% |
+| model-based | 0.494 | 0.845 | 0.1605 | 15.7% |
+| **Bayesian** | **0.499** | 0.871 | 0.1442 | 16.3% |
 
 **Read the first column, not the second.** With one well the low-frequency
 model is built from the same log the result is scored against, so the full-band
@@ -116,24 +116,35 @@ inversion actually recovered from the seismic. The seismic residual is blind
 everywhere: it is measured over all 601 traces without reference to the well.
 
 The method ranking matches the synthetic study — Bayesian best, then
-model-based — but the absolute numbers are much lower (0.40 against 0.56), and
-the reason is the well tie, not the engines. L-30 has no checkshot in the open
-release, so the time-depth comes from integrating the sonic; the resulting tie
-correlation is 0.45 and the estimated wavelet carries +74° of constant phase.
-Everything downstream inherits that.
+model-based — and every engine now beats the background it was regularised
+toward.
 
-Two findings worth stating plainly:
+**The tie dominates everything.** L-30 has no checkshot in the open release, so
+its time-depth comes from integrating the sonic, and a sonic-derived time-depth
+drifts. Allowing a stretch on top of the bulk shift is worth **+0.330 of tie
+correlation** here (0.295 → 0.626), which lifts the extracted wavelet's tie from
+0.45 to 0.67 and drops its constant phase from +74° to +48°. Every score in the
+table above moved with it:
 
-- **Sparse-spike scores *below* the background model** (0.293 against 0.319)
-  while fitting the seismic almost exactly (0.5% residual). That is the
-  signature of over-fitting: with a phase-rotated wavelet, driving the residual
-  to zero means fitting noise. On synthetic data, where the wavelet is exact,
-  the same engine beats the baseline. Sparse-spike is the method most sensitive
-  to tie quality, and this is what that looks like.
-- **A sonic-drift (stretch) correction is worth +0.045 of tie correlation** over
-  bulk shift alone. The app's tie step offers bulk shift only — deliberately, as
-  a v1 scope decision — so the script has to apply the stretch outside it. On
-  data without a checkshot that limitation costs real accuracy.
+| | bulk shift only | with the stretch |
+|---|---|---|
+| low-frequency model | 0.319 | 0.333 |
+| coloured | 0.337 | 0.490 |
+| sparse-spike | 0.293 | 0.374 |
+| model-based | 0.384 | 0.494 |
+| Bayesian | 0.395 | 0.499 |
+
+No engine changed. The tie did. On data without a checkshot, tie quality is
+worth more than the choice of inversion method — which is the single most
+useful thing this validation has produced.
+
+**Sparse-spike needs its regularisation chosen, not guessed.** Left at a default
+sparsity it drove the seismic residual to 0.5% — an almost exact fit — and
+scored 0.231, *below* the background model: everything it added above the
+background was noise. Choosing the weight by the discrepancy principle instead
+(residual matched to a 10% noise level) moved it to 0.374, above the background,
+with the residual landing on 10.1% as intended. It remains the engine most
+sensitive to tie and wavelet quality.
 
 ---
 
@@ -145,11 +156,13 @@ Two findings worth stating plainly:
 | **2 - Seismic viewer** | Inline, crossline, time slice and an arbitrary traverse through chosen wells, with gain, clip and colour-scale controls and well overlays. |
 | **3 - Log QC** | Curve inventory per well, assign which curve is Vp / density / TWT and in what unit, rename wells, pass-fail sanity checks, checkshot / deviation / marker review. |
 | **4 - Well correlation** | Wells side by side in a chosen order with logs, tops and the seismic trace at each, correlation lines between tops, and flattening on a datum. |
-| **5 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, constant bulk shift. |
-| **6 - Wavelet** | Parametric, statistical or well-based extraction, with amplitude/phase spectrum QC. |
-| **7 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally guided by horizons. |
-| **8 - Inversion** | Four methods (coloured, sparse-spike, model-based, Bayesian), method-specific parameters, single-trace QC, preview on a subset, full-volume run. |
-| **9 - Results & export** | Section viewer, time slice, per-trace QC maps, posterior uncertainty and P10/P90 where available, crossplot against well logs, export. |
+| **5 - Well tie QC** | Per-well synthetic-vs-extracted overlay, tie score table, bulk shift, and an optimiser that adds stretch and squeeze. Optional sampling down the borehole for deviated wells. |
+| **6 - Wavelet** | Parametric, statistical or well-based extraction with spectrum QC, plus bulk Q estimation and a wavelet extracted per time window to show how far it drifts. |
+| **7 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally flattened on one horizon or proportionally between several. |
+| **8 - Inversion** | Four methods (coloured, sparse-spike, model-based, Bayesian), method-specific parameters, sparsity chosen from the noise level, optional lateral coupling, stochastic realisations, single-trace QC, preview on a subset, full-volume run. |
+| **9 - Blind validation** | Leave-one-out cross-validation: each well held out, the background rebuilt without it, and the inversion scored against a log it has never seen. |
+| **10 - Rock property** | Fit impedance to a well curve, predict it over the cube, and turn a cut-off into a probability and an expected net thickness. |
+| **11 - Results & export** | Section viewer, time slice, per-trace QC maps, posterior uncertainty and P10/P90 where available, crossplot against well logs, export. |
 
 Step numbers are derived from one list in `app.py`, and every "see step N" in the
 help text is generated from it, so inserting a page cannot leave stale numbering
@@ -320,6 +333,165 @@ Measured against the four synthetic wells it recovers absolute impedance about
 as well as the model-based engine (log-impedance RMSE 0.068 against 0.069) at
 roughly half the runtime, and carries an uncertainty estimate the other engines
 cannot provide.
+
+---
+
+## Blind validation
+
+Scoring an inversion at a well that helped build its own background model
+measures the background model. The full-band correlation in the Penobscot table
+above is 0.94 for the background *alone* — it looks like a triumph and means
+nothing, because the background is the well.
+
+Step 9 runs the honest experiment instead. Each well is held out, the
+low-frequency model is rebuilt from the others, the held-out trace is inverted,
+and the result is scored against a log the model has never seen. Only that
+well's own trace is inverted, so a fold costs one trace and the whole sweep
+costs about as much as inverting a handful — whatever the size of the survey.
+
+Two numbers are reported side by side: the blind score for the inversion, and
+the blind score for the background model alone. **An engine that cannot beat its
+own background at a blind well has added nothing**, however good the section
+looks. The difference is reported as the uplift.
+
+On the synthetic case, where the background's blind score collapses to ~0.00
+once its well is removed, all four engines beat it at all four wells. That
+collapse — from 0.31 when the well is included to 0.00 when it is not — is the
+clearest possible statement of why a non-blind score should not be quoted.
+
+Blind validation needs at least two located wells. With one, holding it out
+leaves nothing to build a background from, which is precisely why a single-well
+score cannot be blind — and why the Penobscot section above says so explicitly
+rather than quoting the flattering number.
+
+---
+
+## Uncertainty, coupling and realisations
+
+Three things follow from the Bayesian engine returning a *distribution* rather
+than a number.
+
+### Posterior variance without forming the inverse
+
+The obvious way to get the posterior standard deviation is to back-substitute
+against the identity, but that computes all `n²` entries of the inverse to keep
+`n` of them: `O(n² b)` flops and `O(n²)` memory, so it goes quadratic exactly
+when traces get long. The **Takahashi recursion** computes only the entries
+inside the factor's band, which is `O(n b²)`. Measured on the 31-band system:
+
+| trace length | dense identity | selected inversion | speed-up |
+|---|---|---|---|
+| 701 | 18.0 ms | 6.6 ms | 2.7× |
+| 1501 | 174.8 ms | 14.4 ms | 12.2× |
+| 3001 | 1058.9 ms | 27.9 ms | 37.9× |
+
+Identical to the dense answer to 8e-16 — it is the same number, computed without
+the wasted work.
+
+### Lateral coupling
+
+Every engine here treats each trace as an independent 1D problem, so nothing
+stops two neighbours disagreeing by more than the seismic can justify. That is
+what vertical striping in a noisy inverted section actually is: independent
+estimation errors, side by side.
+
+Adding a lateral roughness term to the joint prior gives a precision matrix that
+is far too large to factor directly — it is (traces × samples) square — but it
+is block-sparse, so a **block Gauss-Seidel sweep** solves it one trace at a time
+against the current estimate of its neighbours. Each block solve is the same
+banded Cholesky as the 1D engine, so a run costs `n_sweeps` times a 1D run, and
+because the sweep is coordinate descent on a convex quadratic it converges
+monotonically.
+
+A lateral weight of zero reproduces the independent result *exactly* — asserted
+in the tests, because a "generalisation" that changes the answer at its identity
+setting is not one.
+
+### Stochastic realisations
+
+The point estimate is the posterior *mean*: smooth, band-limited, and by
+construction the one model no realisation looks like. Sampling the same
+posterior gives models that are each consistent with the seismic and the prior,
+and whose spread *is* the uncertainty — which is what you want before quoting a
+thickness or a contact.
+
+Sampling is almost free once the factorisation exists. With `A = UᵀU` and `z`
+standard normal, `U⁻¹z` has covariance `A⁻¹`, so each realisation is one banded
+triangular solve: `m_sample = m_map + solve(U, z)`. No Gibbs sampler, no burn-in,
+no convergence to argue about — these are independent exact draws, because the
+posterior really is Gaussian. 250 draws on a 400-sample trace take about 60 ms.
+
+---
+
+## From impedance to a rock property
+
+Impedance is an intermediate quantity — nobody drills on it. Step 10 fits a
+transform from `ln(AI)` to a well curve, applies it to the cube, and carries the
+uncertainty through.
+
+Fitting in `ln(AI)` rather than `AI` is deliberate: impedance is a positive,
+roughly log-normal quantity, most petrophysical trends are closer to straight in
+the log domain, and it makes the uncertainty propagation exact rather than
+approximate, because the inversion's posterior is Gaussian in `ln(AI)`.
+
+Two independent uncertainties are combined, because dropping either flatters the
+answer:
+
+```
+sigma_P² = (dP/dln(AI) · sigma_lnAI)²  +  sigma_fit²
+```
+
+The first term is what the seismic did not resolve; the second is the scatter of
+the wells about the transform, which stays whatever the seismic does. Given a
+deterministic cube only the second is available, and the app says so rather than
+letting it pass as the full uncertainty.
+
+That combined sigma is what makes a **cut-off** answerable. Asking "is porosity
+above 12% here?" of a single number gives a yes or a no, both overconfident.
+Asking it of a distribution gives a probability, and summing that probability
+down a trace gives an expected net thickness that already accounts for how well
+the seismic resolved the impedance. Where the seismic constrained it tightly the
+probability sits near 0 or 1; where it did not, it drifts toward 0.5 instead of
+pretending to know.
+
+---
+
+## Absorption
+
+One wavelet for a three-second volume is an assumption, not a measurement. The
+earth is anelastic: high frequencies are absorbed faster than low ones, so a
+wavelet at 2,500 ms is narrower-band and more phase-rotated than the same
+wavelet at 800 ms. Step 6 measures that two ways.
+
+**A wavelet per time window**, extracted from the wells in overlapping windows
+and blended linearly between window centres. A drift of a few Hz across the
+volume is normal and the stationary wavelet is fine; tens of Hz means the deep
+section is being inverted with a wavelet it does not have.
+
+**A bulk Q** from the classical spectral-ratio method: between two windows the
+amplitude spectra differ by `exp(-π f Δt / Q)`, so `ln(A_deep/A_shallow)` is
+linear in `f` with slope `-π Δt / Q`.
+
+The band matters more than anything else here. Outside the seismic's own
+bandwidth both spectra are near zero, their ratio is numerical noise near one,
+and including that flattens the slope and inflates Q. Measured against synthetic
+data with a known Q of 40, a band of 8–70 Hz on 35 Hz data returned **127**;
+narrowing to 18–40 Hz returned **52**. So the band is taken from the data by
+default — where the shallow window still holds 60% of its peak amplitude — and
+`R²` is the honest guide either way: the badly-biased run scored 0.56, the good
+one 0.99.
+
+Even with a sensible band this is a rough number, biased high under strong
+absorption (Q 150 → 158, Q 80 → 86, Q 40 → 62). Treat it as an order of
+magnitude for sizing an inverse-Q gain, not as a rock property.
+
+Inverse-Q filtering is applied window by window, since absorption is
+non-stationary and cannot be one filter. The trace is reflect-padded, split into
+overlapping Hann-tapered windows, each filtered with the constant-Q operator for
+its own centre time, and summed. The gain is capped (default 20 dB) because
+otherwise inverse Q amplifies the highest frequencies without bound — and since
+those are mostly noise, the result is an unusable trace with a beautiful
+spectrum.
 
 ---
 
@@ -544,13 +716,39 @@ to build one:
 - A **checkshot** attached on step 1 takes precedence over both, and is the
   preferred route (see above).
 - A constant **bulk shift** per well is available for a datum error; markers
-  move with it. Stretch and squeeze are out of scope for v1 (see *Not in this
-  version*).
+  move with it.
+- **Stretch and squeeze** is available on top of that, as a piecewise-linear
+  warp over a handful of knots. See below.
 
 Each well is located against the seismic grid by KD-tree lookup of the nearest
 *live* traces, blended by inverse-distance weighting. Restricting the search to
 live traces means a well near the survey edge still gets real amplitudes rather
-than a dead trace.
+than a dead trace. For a **deviated** well the tie step can instead sample the
+seismic *down the borehole*: at each time sample the well's time-depth gives the
+measured depth, the deviation survey gives the map position there, and the trace
+value is taken from that bin. A 1,000 m step-out puts the reservoir tens of bins
+from the wellhead, and tying those logs to the surface trace ties them to the
+wrong rock. Vertical wells are unaffected — the two routes return byte-identical
+traces, which is asserted in the tests.
+
+### Stretch and squeeze
+
+A bulk shift fixes a datum error. It cannot fix a time-depth that *drifts*,
+which is what you get whenever the time-depth comes from integrating a sonic
+rather than from a checkshot. The optimiser searches a bulk shift first, then a
+piecewise-linear warp over a few knots, subject to two constraints:
+
+- **The wavelet is held fixed while the warp is searched.** A wavelet
+  re-estimated inside the loop absorbs timing error — a matching filter has
+  enough freedom to fit almost any misalignment — so the reported improvement
+  would be measuring the wavelet, not the tie.
+- **The warp must stay monotonic.** Time cannot run backwards; a warp that would
+  fold the log is rejected rather than quietly applied.
+
+If the stretch does not beat the bulk shift it is discarded, so a well with a
+good checkshot is left exactly as it was. On Penobscot L-30 — a real well with
+no checkshot — it was worth **+0.330** of tie correlation, and lifted every
+inversion engine with it (see *Validation on real field data*).
 
 ---
 
@@ -567,7 +765,14 @@ With horizons loaded, interpolation happens in horizon-flattened time and the
 result is restored to structure, so the trend follows the geology instead of
 cutting across it. Without horizons it is a flat time-slice interpolation,
 which is only defensible where structure is gentle — the app says so on the
-page. v1 uses the first horizon as the flattening datum.
+page.
+
+**One horizon** gives a constant per-trace datum shift. **Two or more** give
+proportional (layer-cake) flattening: each interval is stretched onto the
+interval between those horizons' mean times, so the trend follows thickness
+variation and not just structure. Horizons are sorted into stratigraphic order
+by mean time, so the order they arrive in does not matter, and crossing picks
+are forced apart by one sample rather than being allowed to fold the warp.
 
 ---
 
@@ -584,7 +789,19 @@ on a single core:
 | Model-based | 43.6 s | 27.3 ms | L-BFGS-B, up to 60 iterations |
 
 Per-trace cost also grows with trace length and wavelet length, so these are
-indicative rather than a formula.
+indicative rather than a formula. The Bayesian figure is now roughly flat in
+trace length rather than quadratic: on the real 701-sample Penobscot line it
+runs at 9 ms/trace with uncertainty on, against 14 ms before the posterior
+variance was moved onto the Takahashi recursion.
+
+Optional extras cost roughly:
+
+| | Cost |
+| --- | --- |
+| Lateral coupling | `n_sweeps` × a 1D Bayesian run (default 3) |
+| Stochastic realisations | one triangular solve each — 250 draws ≈ 60 ms per trace |
+| Blind cross-validation | one background rebuild and one trace per well |
+| Auto-sparsity | 8–14 trial solves on a sample of traces, once per run |
 
 Both slow methods scale linearly in trace count, so a production volume is
 hours, not seconds. The app is built around that:
@@ -610,7 +827,10 @@ seismic_inversion_app/
 │   ├── data_io.py            # SEG-Y + LAS loading, containers, synthetic generator
 │   ├── wavelet.py            # parametric, statistical and well-based extraction
 │   ├── inversion.py          # the four engines, volume runner, crossplot QC
-│   ├── low_freq_model.py     # background impedance model
+│   ├── low_freq_model.py     # background impedance model, horizon flattening
+│   ├── welltie.py            # bulk shift + stretch/squeeze optimiser
+│   ├── crossval.py           # blind leave-one-out validation
+│   ├── rockphysics.py        # impedance -> property, with uncertainty
 │   ├── visualization.py      # plotly sections, spectra, tie QC, crossplots
 │   └── utils.py              # units, filtering, geometry, impedance algebra
 ├── scripts/
@@ -631,15 +851,17 @@ Deferred deliberately, and flagged where the UI would otherwise imply
 otherwise:
 
 - **Pre-stack, AVO and simultaneous inversion.** Post-stack only; there is no
-  angle-gather handling and no elastic (Vs / density) output.
-- **Stretch and squeeze.** Bulk shift only. A bulk shift can fix a datum error;
-  it cannot fix a drifting time-depth relationship.
-- **Non-stationary wavelets.** One wavelet for the whole volume. No spatially
-  or temporally varying extraction, and no Q compensation.
-- **Uncertainty quantification.** Each engine returns one answer, not a
-  posterior distribution.
-- **Multi-horizon flattening.** With several horizons loaded, v1 flattens on the
-  first rather than doing proportional layer-cake flattening between them.
-- **Deviated-well trace extraction.** Deviation surveys are read and reported,
-  but the seismic trace is taken at the surface location, not along the
-  borehole path.
+  angle-gather handling and no elastic (Vs / density) output. This is the one
+  large capability still missing, and it is a different tool rather than a
+  setting: new data model, Aki-Richards, angle-dependent wavelets.
+- **Interval Q.** Absorption is estimated as a single bulk Q between two
+  windows and applied as a constant-Q operator. There is no layer-by-layer Q
+  profile, and the estimate is biased high under strong absorption.
+- **Anisotropy.** Vertical velocity only.
+- **Automatic horizon interpretation.** Horizons are read from a CSV; nothing
+  here picks them.
+
+Since the first version, five of the original non-goals have been closed and
+are now documented above: stretch and squeeze, uncertainty quantification,
+non-stationary wavelets, multi-horizon proportional flattening, and
+deviated-well trace extraction.

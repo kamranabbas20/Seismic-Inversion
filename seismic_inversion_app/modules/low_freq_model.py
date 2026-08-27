@@ -159,8 +159,12 @@ def build_low_frequency_model(
     where structure is gentle.
 
     ``horizons`` maps a name to a ``(n_iline, n_xline)`` array of TWT in ms.
-    Two or more horizons drive a proportional (layer-cake) flattening; a single
-    horizon drives a simple datum shift.
+    A single horizon drives a constant per-trace datum shift; two or more drive
+    proportional (layer-cake) flattening, where each interval is stretched onto
+    the interval between the horizons' mean times, so the trend follows
+    thickness variation and not just structure.  Horizons are sorted into
+    stratigraphic order by mean time, so the caller's dict order does not
+    matter.
     """
     twt = volume.twt
     dt = volume.dt
@@ -189,12 +193,12 @@ def build_low_frequency_model(
     grid_xy = volume.trace_xy()
     notes: list[str] = []
 
-    shift_grid = None
+    flatten = None
     if horizons:
-        shift_grid, well_shift, note = _structural_shifts(horizons, volume, well_xy)
+        flatten, well_map, note = _structural_knots(horizons, volume, well_xy)
         notes.append(note)
-        if well_shift is not None:
-            well_logs = _shift_logs(well_logs, -well_shift, dt)
+        if well_map is not None and well_logs.shape[0]:
+            well_logs = _flatten_logs(well_logs, well_map[0], well_map[1], twt)
 
     out = np.empty((grid_xy.shape[0], n_t), dtype=np.float32)
     for k in range(n_t):
@@ -206,8 +210,8 @@ def build_low_frequency_model(
 
     cube = out.reshape(n_il, n_xl, n_t)
 
-    if shift_grid is not None:
-        cube = _unflatten_cube(cube, shift_grid, dt)
+    if flatten is not None:
+        cube = _unflatten_cube(cube, flatten[0], flatten[1], twt)
         notes.append("interpolated in horizon-flattened time, then restored to structure")
 
     if lateral_smooth_bins and lateral_smooth_bins > 0:
@@ -234,48 +238,87 @@ def build_low_frequency_model(
 # Structural guidance
 # --------------------------------------------------------------------------
 
-def _structural_shifts(horizons: dict[str, np.ndarray], volume, well_xy: np.ndarray):
-    """Per-trace flattening shift (in ms) derived from the supplied horizons."""
-    grids = [np.asarray(h, dtype=float) for h in horizons.values() if np.asarray(h).shape == volume.data.shape[:2]]
-    if not grids:
+# Sentinel knots placed far outside the data so the piecewise-linear warp
+# extrapolates with unit slope -- a constant shift -- above the shallowest
+# horizon and below the deepest, rather than flattening out.
+_FAR = 1.0e6
+
+
+def _structural_knots(horizons: dict[str, np.ndarray], volume, well_xy: np.ndarray):
+    """Per-trace horizon times and the flattened datum each maps to.
+
+    With one horizon this is a constant shift per trace.  With two or more it
+    is proportional (layer-cake) flattening: the interval between consecutive
+    horizons is stretched onto the interval between their mean times, so the
+    trend follows structure *and* thickness variation instead of only being
+    hung off a single datum.
+    """
+    named = [(name, np.asarray(h, dtype=float)) for name, h in horizons.items()
+             if np.asarray(h).shape == volume.data.shape[:2]]
+    if not named:
         return None, None, "horizons ignored (grid shape did not match the seismic)"
 
-    ref = grids[0]
-    shift = ref - float(np.nanmean(ref))            # ms, positive = deeper than datum
-    shift = np.nan_to_num(shift)
+    # Stratigraphic order, shallowest first -- the caller's dict order is not
+    # required to be meaningful.
+    named.sort(key=lambda nh: float(np.nanmean(nh[1])))
+    names = [n for n, _ in named]
+    grids = []
+    for _, g in named:
+        mean = float(np.nanmean(g))
+        grids.append(np.nan_to_num(g, nan=mean if np.isfinite(mean) else 0.0))
 
-    # Sample the shift at each well by nearest bin.
+    struct = np.stack(grids, axis=-1)                       # (n_il, n_xl, m)
+    flat = np.array([float(np.mean(g)) for g in grids])     # common datums
+
+    # Crossing picks would fold the warp.  Force a minimum separation instead
+    # of trusting the interpretation to be clean.
+    min_gap = max(volume.sample_rate_ms, 1e-3)
+    for k in range(1, struct.shape[-1]):
+        struct[..., k] = np.maximum(struct[..., k], struct[..., k - 1] + min_gap)
+    flat = np.maximum.accumulate(flat)
+    for k in range(1, flat.size):
+        flat[k] = max(flat[k], flat[k - 1] + min_gap)
+
     grid_xy = volume.trace_xy()
-    flat_shift = shift.ravel()
-    well_shift = np.array([
-        flat_shift[int(np.argmin(np.linalg.norm(grid_xy - p, axis=1)))] for p in well_xy
-    ])
-    note = f"flattened on '{list(horizons)[0]}'"
-    if len(grids) > 1:
-        note += f" (of {len(grids)} horizons; v1 uses the first as the flattening datum)"
-    return shift, well_shift, note
+    flat_struct = struct.reshape(-1, struct.shape[-1])
+    well_knots = np.array([
+        flat_struct[int(np.argmin(np.linalg.norm(grid_xy - p, axis=1)))] for p in well_xy
+    ]) if len(well_xy) else np.empty((0, struct.shape[-1]))
+
+    if len(grids) == 1:
+        note = f"flattened on '{names[0]}'"
+    else:
+        note = f"proportionally flattened between {len(grids)} horizons: " + ", ".join(names)
+    return (struct, flat), (well_knots, flat), note
 
 
-def _shift_logs(logs: np.ndarray, shift_ms: np.ndarray, dt: float) -> np.ndarray:
-    """Shift each well log in time by its own amount (positive = later)."""
+def _warp_axis(t_axis: np.ndarray, src_knots: np.ndarray, dst_knots: np.ndarray) -> np.ndarray:
+    """Times in the source domain that correspond to each destination sample."""
+    src = np.concatenate(([src_knots[0] - _FAR], src_knots, [src_knots[-1] + _FAR]))
+    dst = np.concatenate(([dst_knots[0] - _FAR], dst_knots, [dst_knots[-1] + _FAR]))
+    return np.interp(t_axis, dst, src)
+
+
+def _flatten_logs(logs: np.ndarray, well_knots: np.ndarray, flat_knots: np.ndarray,
+                  twt: np.ndarray) -> np.ndarray:
+    """Move each well log from structural time into flattened time."""
     out = np.empty_like(logs)
-    n_t = logs.shape[1]
-    base = np.arange(n_t, dtype=float)
     for i in range(logs.shape[0]):
-        s = float(shift_ms[i]) / (dt * 1000.0)
-        out[i] = np.interp(base + s, base, logs[i], left=logs[i][0], right=logs[i][-1])
+        src_t = _warp_axis(twt, well_knots[i], flat_knots)
+        out[i] = np.interp(src_t, twt, logs[i], left=logs[i][0], right=logs[i][-1])
     return out
 
 
-def _unflatten_cube(cube: np.ndarray, shift_ms: np.ndarray, dt: float) -> np.ndarray:
-    """Restore a flattened cube to structural time."""
-    n_il, n_xl, n_t = cube.shape
-    base = np.arange(n_t, dtype=float)
+def _unflatten_cube(cube: np.ndarray, struct: np.ndarray, flat_knots: np.ndarray,
+                    twt: np.ndarray) -> np.ndarray:
+    """Restore a flattened cube to structural time, trace by trace."""
+    n_il, n_xl, _ = cube.shape
     out = np.empty_like(cube)
     for i in range(n_il):
         for j in range(n_xl):
-            s = float(shift_ms[i, j]) / (dt * 1000.0)
-            out[i, j] = np.interp(base - s, base, cube[i, j], left=cube[i, j][0], right=cube[i, j][-1])
+            dst_t = _warp_axis(twt, flat_knots, struct[i, j])
+            trace = cube[i, j]
+            out[i, j] = np.interp(dst_t, twt, trace, left=trace[0], right=trace[-1])
     return out
 
 

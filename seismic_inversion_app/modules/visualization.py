@@ -1078,3 +1078,112 @@ def well_overlay_positions(ties: Sequence, orientation: str, index: int,
         t1 = float(tie.twt[good].max()) if good.any() else float(tie.twt.max())
         out.append({"name": tie.well, "position": pos, "t_min": t0, "t_max": t1})
     return out
+
+
+def property_fit_figure(points: dict, fit, height: int = 480) -> go.Figure:
+    """Impedance against a well property, with the fitted transform over it.
+
+    Colouring by well rather than pooling the points is deliberate: a transform
+    that looks tight overall but splits into one cloud per well is telling you
+    the relation is well-specific, and applying it across the survey will invent
+    structure that follows nothing but the well locations.
+    """
+    fig = go.Figure()
+    for i, (name, d) in enumerate(points.items()):
+        fig.add_trace(go.Scattergl(
+            x=np.asarray(d["ai"]) / 1e6, y=d["property"], mode="markers", name=name,
+            marker=dict(size=4, opacity=0.45, color=_MARKER_PALETTE[i % len(_MARKER_PALETTE)]),
+            hovertemplate="AI %{x:.2f}e6<br>%{y:.4g}<extra>" + name + "</extra>"))
+
+    all_ai = np.concatenate([d["ai"] for d in points.values()]) if points else np.array([1.0, 2.0])
+    grid = np.linspace(float(all_ai.min()), float(all_ai.max()), 200)
+    fig.add_trace(go.Scatter(
+        x=grid / 1e6, y=fit.predict(grid), mode="lines", name="fit",
+        line=dict(color="#111111", width=2.5)))
+    band = fit.residual_std
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([grid, grid[::-1]]) / 1e6,
+        y=np.concatenate([fit.predict(grid) + band, (fit.predict(grid) - band)[::-1]]),
+        fill="toself", fillcolor="rgba(17,17,17,0.10)", line=dict(width=0),
+        name="+/- 1 sd of the fit", hoverinfo="skip"))
+
+    unit = f" [{fit.unit}]" if fit.unit else ""
+    fig.update_layout(
+        title=f"{fit.property_name}{unit} against acoustic impedance "
+              f"(R² {fit.r_squared:.2f}, {fit.n_points} points)",
+        template=_TEMPLATE, height=height,
+        xaxis_title="acoustic impedance (10⁶ m/s·kg/m³)",
+        yaxis_title=f"{fit.property_name}{unit}",
+        margin=dict(l=60, r=20, t=55, b=50))
+    return fig
+
+
+def realisations_figure(draws: dict, twt: np.ndarray, well_ai=None,
+                        gate=None, height: int = 560, max_shown: int = 40) -> go.Figure:
+    """Stochastic realisations against the posterior mean and the well.
+
+    Individual draws are plotted thin and translucent so the *envelope* is what
+    the eye picks up, with the mean over the top: the point of the panel is that
+    the mean is smoother than any realisation, not that any one draw matters.
+    """
+    twt = np.asarray(twt, dtype=float)
+    ai = np.asarray(draws["absolute_ai"], dtype=float)
+    fig = go.Figure()
+
+    step = max(1, ai.shape[0] // max_shown)
+    for k in range(0, ai.shape[0], step):
+        fig.add_trace(go.Scatter(
+            x=ai[k] / 1e6, y=twt, mode="lines",
+            line=dict(color="rgba(120,140,170,0.30)", width=0.8),
+            showlegend=(k == 0), name="realisations", hoverinfo="skip"))
+
+    fig.add_trace(go.Scatter(x=np.asarray(draws["p10"]) / 1e6, y=twt, mode="lines",
+                             line=dict(color="rgba(31,119,180,0.7)", width=1, dash="dot"), name="P10"))
+    fig.add_trace(go.Scatter(x=np.asarray(draws["p90"]) / 1e6, y=twt, mode="lines",
+                             line=dict(color="rgba(31,119,180,0.7)", width=1, dash="dot"), name="P90"))
+    fig.add_trace(go.Scatter(x=np.asarray(draws["mean_ai"]) / 1e6, y=twt, mode="lines",
+                             line=dict(color="#d62728", width=2), name="posterior mean"))
+    if well_ai is not None:
+        w = np.asarray(well_ai, dtype=float)
+        good = np.isfinite(w) & (w > 0)
+        if good.any():
+            fig.add_trace(go.Scatter(x=w[good] / 1e6, y=twt[good], mode="lines",
+                                     line=dict(color="#111111", width=1.6), name="well"))
+
+    fig.update_layout(
+        title="Equiprobable realisations from the posterior",
+        template=_TEMPLATE, height=height,
+        xaxis_title="acoustic impedance (10⁶ m/s·kg/m³)", yaxis_title="TWT (ms)",
+        margin=dict(l=60, r=20, t=50, b=45), legend=dict(orientation="h", y=-0.12))
+    fig.update_yaxes(autorange="reversed")
+    if gate is not None:
+        fig.update_yaxes(range=[gate[1], gate[0]])
+    return fig
+
+
+def nonstationary_wavelet_figure(nsw, height: int = 460) -> go.Figure:
+    """Each window's wavelet and spectrum, so the drift is visible at a glance."""
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Wavelets by window", "Amplitude spectra"))
+    t_axis = (np.arange(nsw.wavelets.shape[1]) - nsw.wavelets.shape[1] // 2) * nsw.dt * 1000.0
+    for i, centre in enumerate(nsw.centres_ms):
+        colour = _MARKER_PALETTE[i % len(_MARKER_PALETTE)]
+        w = nsw.wavelets[i]
+        peak = float(np.max(np.abs(w))) or 1.0
+        fig.add_trace(go.Scatter(x=t_axis, y=w / peak, mode="lines", name=f"{centre:.0f} ms",
+                                 line=dict(color=colour, width=1.8)), row=1, col=1)
+        freq, amp = utils.amplitude_spectrum(w, nsw.dt, pad=4096)
+        keep = freq <= min(0.5 / nsw.dt, 120)
+        peak_a = float(np.max(amp)) or 1.0
+        fig.add_trace(go.Scatter(x=freq[keep], y=amp[keep] / peak_a, mode="lines",
+                                 name=f"{centre:.0f} ms", showlegend=False,
+                                 line=dict(color=colour, width=1.8)), row=1, col=2)
+
+    fig.update_xaxes(title_text="lag (ms)", row=1, col=1)
+    fig.update_xaxes(title_text="frequency (Hz)", row=1, col=2)
+    fig.update_yaxes(title_text="normalised amplitude", row=1, col=1)
+    fig.update_layout(template=_TEMPLATE, height=height,
+                      margin=dict(l=60, r=20, t=55, b=45),
+                      legend=dict(orientation="h", y=-0.18))
+    return fig

@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from modules import data_io, inversion, low_freq_model, utils, visualization as viz, wavelet as wvl
+from modules import (crossval, data_io, inversion, low_freq_model, rockphysics, utils,
+                     visualization as viz, wavelet as wvl, welltie)
 
 st.set_page_config(page_title="Post-Stack Seismic Inversion", page_icon="~", layout="wide")
 
@@ -38,6 +39,8 @@ PAGES = [
     ("wavelet", "Wavelet"),
     ("lfm", "Low-frequency model"),
     ("inversion", "Inversion"),
+    ("validation", "Blind validation"),
+    ("property", "Rock property"),
     ("results", "Results & export"),
 ]
 STEPS = [f"{i} - {label}" for i, (_, label) in enumerate(PAGES, start=1)]
@@ -67,6 +70,14 @@ DEFAULTS = {
     "segy_path": None,
     "gate": None,
     "k_neighbours": 4,
+    "tie_solutions": None,
+    "crossval": None,
+    "property_fit": None,
+    "property_cube": None,
+    "realisations": None,
+    "nonstationary_wavelet": None,
+    "q_estimate": None,
+    "follow_borehole": False,
     "job": None,
     "log": [],
     "_flash": None,
@@ -119,7 +130,12 @@ def rebuild_ties(reason: str = "") -> None:
     if vol is None or not wells:
         st.session_state.ties = []
         return
-    st.session_state.ties = data_io.extract_well_traces(vol, wells, k=st.session_state.k_neighbours)
+    if st.session_state.get("follow_borehole"):
+        st.session_state.ties = data_io.extract_well_traces_along_path(
+            vol, wells, k=st.session_state.k_neighbours)
+    else:
+        st.session_state.ties = data_io.extract_well_traces(
+            vol, wells, k=st.session_state.k_neighbours)
     if reason:
         log(f"ties rebuilt ({len(st.session_state.ties)} wells) - {reason}")
 
@@ -1180,9 +1196,9 @@ def page_well_tie() -> None:
         return
 
     st.caption(
-        "This step *verifies* the tie rather than building one: the time-depth relationship is "
-        "assumed to come from upstream. A constant bulk shift is available for a datum error; "
-        "stretch and squeeze are out of scope for v1."
+        "This step verifies the tie and, where the time-depth drifts, repairs it. A bulk shift "
+        "fixes a datum error; a stretch fixes a sonic-derived time-depth that drifts with depth, "
+        "which is what you get whenever there is no checkshot."
     )
 
     gate = get_gate()
@@ -1193,6 +1209,24 @@ def page_well_tie() -> None:
         if k != st.session_state.k_neighbours:
             st.session_state.k_neighbours = int(k)
             rebuild_ties("neighbour count changed")
+            st.rerun()
+
+        deviated = [w for w in wells if getattr(w, "track", None) is not None
+                    and not w.track.is_vertical]
+        follow = st.checkbox(
+            "Follow the borehole path", value=bool(st.session_state.follow_borehole),
+            disabled=not deviated,
+            help="Sample the seismic down the well path instead of at the surface location. "
+                 "Needs a deviation survey; vertical wells are unaffected either way.")
+        if deviated:
+            st.caption(f"{len(deviated)} deviated well(s): "
+                       + ", ".join(f"{w.name} ({w.track.max_deviation:.0f} m)" for w in deviated[:4]))
+        else:
+            st.caption("No deviated wells loaded, so this changes nothing.")
+        if bool(follow) != bool(st.session_state.follow_borehole):
+            st.session_state.follow_borehole = bool(follow)
+            rebuild_ties("borehole path toggled")
+            invalidate("wavelet", "colour_operator", "lfm", "result")
             st.rerun()
 
     qc_wavelet = st.session_state.wavelet
@@ -1246,6 +1280,56 @@ def page_well_tie() -> None:
             viz.well_tie_figure(tie, qc_samples, gate[0], gate[1],
                                 markers=well.markers_in_range(gate[0], gate[1])),
             width="stretch")
+
+    st.divider()
+    st.subheader("Stretch and squeeze")
+    st.caption(
+        "A bulk shift can only move the whole well. When the time-depth comes from integrating a "
+        "sonic -- no checkshot -- the error grows with depth instead, and no single shift fixes "
+        "it. This searches a bulk shift first, then a piecewise-linear stretch on top, holding "
+        "the wavelet **fixed** throughout: a wavelet re-estimated inside the loop would absorb "
+        "the timing error and report an improvement that is not there."
+    )
+    o1, o2, o3, o4 = st.columns(4)
+    n_knots = o1.slider("Knots", 1, 8, welltie.DEFAULT_KNOTS,
+                        help="1 = bulk shift only. More knots allow the drift to change with depth.")
+    max_shift = o2.slider("Max bulk shift (ms)", 10, 200, int(welltie.MAX_BULK_SHIFT_MS), 5)
+    max_drift = o3.slider("Max drift per knot (ms)", 0, 100, int(welltie.MAX_DRIFT_MS), 5)
+    scope = o4.radio("Apply to", ["This well", "All wells"], horizontal=False)
+
+    if st.button("Optimise tie", type="primary"):
+        bar = st.progress(0.0, text="tying")
+        targets = [well] if scope == "This well" else [w for w in wells if w.has_location]
+        results = {}
+        for i, w in enumerate(targets):
+            try:
+                results[w.name] = welltie.optimise_tie(
+                    w, vol, qc_samples, n_knots=int(n_knots), max_shift_ms=float(max_shift),
+                    max_drift_ms=float(max_drift), k_neighbours=st.session_state.k_neighbours)
+            except ValueError as exc:
+                st.warning(f"{w.name}: {exc}")
+            bar.progress((i + 1) / max(len(targets), 1), text=f"tied {w.name}")
+        bar.empty()
+        if results:
+            st.session_state.tie_solutions = results
+            rebuild_ties("tie optimised")
+            invalidate("wavelet", "colour_operator", "lfm", "result")
+            st.rerun()
+
+    solutions = st.session_state.get("tie_solutions") or {}
+    if solutions:
+        rows = []
+        for name, sol in solutions.items():
+            row = {"well": name}
+            row.update(sol.summary())
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        gains = [s.drift_gain for s in solutions.values() if np.isfinite(s.drift_gain)]
+        if gains:
+            st.caption(
+                f"The stretch was worth {np.mean(gains):+.3f} of correlation on average. "
+                "If that is ~0 the time-depth was not drifting and the bulk shift was enough, "
+                "which is the expected result for a well with a good checkshot.")
 
 
 # ==========================================================================
@@ -1364,6 +1448,68 @@ def page_wavelet() -> None:
             viz.spectrum_comparison_figure(spectra, max_freq=min(0.5 / vol.dt, 120),
                                            title="Wavelet against seismic and well reflectivity"),
             width="stretch")
+
+    st.divider()
+    st.subheader("Absorption: is one wavelet enough?")
+    st.caption(
+        "One wavelet for the whole volume is an assumption, not a measurement. The earth absorbs "
+        "high frequencies faster than low ones, so a wavelet extracted deep is narrower-band than "
+        "the same wavelet shallow. This measures that drift two ways — directly, by extracting a "
+        "wavelet per time window, and as a bulk Q from the spectral ratio between two windows."
+    )
+    t_lo, t_hi = float(vol.twt[0]), float(vol.twt[-1])
+    q1, q2, q3 = st.columns(3)
+    t_shallow = q1.number_input("Shallow window centre (ms)", t_lo, t_hi,
+                                float(t_lo + 0.25 * (t_hi - t_lo)), 25.0)
+    t_deep = q2.number_input("Deep window centre (ms)", t_lo, t_hi,
+                             float(t_lo + 0.75 * (t_hi - t_lo)), 25.0)
+    q_window = q3.slider("Q window length (ms)", 100, 1200, 400, 50)
+
+    if st.button("Estimate Q"):
+        try:
+            st.session_state.q_estimate = wvl.estimate_q(
+                vol, float(t_shallow), float(t_deep), window_ms=float(q_window))
+            log(f"Q estimated: {st.session_state.q_estimate['Q']:.0f}")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    est = st.session_state.get("q_estimate")
+    if est:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Bulk Q", "infinite" if not np.isfinite(est["Q"]) else f"{est['Q']:.0f}")
+        m2.metric("Fit quality (R²)", f"{est['r_squared']:.2f}")
+        m3.metric("Band used", f"{est['band'][0]:.0f}-{est['band'][1]:.0f} Hz")
+        if est.get("auto_band"):
+            st.caption(est["auto_band"])
+        if est.get("note"):
+            st.warning(est["note"])
+        st.caption(
+            "Q from a spectral ratio is a rough number and is biased high under strong "
+            "absorption — measured against known values it returned 158 for a true 150, but 62 "
+            "for a true 40. Use it to size an inverse-Q gain, not as a rock property. R² below "
+            "about 0.8 means it is measuring a reflectivity contrast rather than absorption.")
+
+    if ties:
+        with st.expander("Wavelet drift with time (non-stationary extraction)"):
+            w1, w2 = st.columns(2)
+            n_win = w1.slider("Time windows", 2, 6, 3, 1)
+            win_ms = w2.slider("Window length (ms)", 200, 2000, 800, 100)
+            if st.button("Extract a wavelet per window"):
+                try:
+                    nsw = wvl.time_varying_wavelet(
+                        ties, vol.dt, vol.twt, n_windows=int(n_win), window_ms=float(win_ms),
+                        length_ms=float(length_ms))
+                    st.session_state.nonstationary_wavelet = nsw
+                except (ValueError, Exception) as exc:  # noqa: BLE001
+                    st.error(f"Non-stationary extraction failed: {exc}")
+            nsw = st.session_state.get("nonstationary_wavelet")
+            if nsw is not None:
+                st.dataframe(kv_table(nsw.summary()), width="stretch")
+                st.plotly_chart(viz.nonstationary_wavelet_figure(nsw), width="stretch")
+                st.caption(
+                    "A frequency drift of a few Hz over the volume is normal and the stationary "
+                    "wavelet is fine. Tens of Hz means the deep section is being inverted with a "
+                    "wavelet it does not have, and the residual is absorbing the difference.")
 
 
 # ==========================================================================
@@ -1526,9 +1672,24 @@ def page_inversion() -> None:
     if method == "coloured":
         params, ready, blockers = _coloured_controls(vol, ties, params)
     elif method == "sparse-spike":
+        auto = st.checkbox(
+            "Choose the sparsity weight from the noise level", value=True,
+            help="Morozov's discrepancy principle: stop fitting once the residual is as large as "
+                 "the noise is believed to be. Under-regularised sparse-spike fits noise and can "
+                 "score below the background model, so this is not a cosmetic setting.")
         c1, c2, c3 = st.columns(3)
-        params["sparsity"] = c1.slider("Sparsity weight", 0.01, 5.0, 0.15, 0.01,
-                                       help="Higher gives fewer, larger spikes and a looser data fit.")
+        if auto:
+            noise = c1.slider("Noise level (% of trace RMS)", 1.0, 50.0, 10.0, 0.5,
+                              help="The residual the solution is allowed to leave behind.")
+            params["_auto_sparsity"] = float(noise)
+            chosen = st.session_state.get("auto_sparsity_result")
+            if chosen:
+                c1.caption(f"Last search chose {chosen['sparsity']:.4g} "
+                           f"(residual {chosen.get('achieved_pct', float('nan')):.1f}% "
+                           f"against a {chosen.get('target_pct', 0):.1f}% target).")
+        else:
+            params["sparsity"] = c1.slider("Sparsity weight", 0.01, 5.0, 0.15, 0.01,
+                                           help="Higher gives fewer, larger spikes and a looser data fit.")
         params["n_iter"] = c2.slider("IRLS iterations", 2, 40, 12, 1)
         params["merge_freq"] = c3.slider("Merge frequency (Hz)", 2.0, 25.0, 10.0, 0.5,
                                          help="Where the inverted band is spliced onto the model.")
@@ -1556,7 +1717,21 @@ def page_inversion() -> None:
                  "posterior fits noise; the reported misfit should land near this value.")
         params["uncertainty"] = st.checkbox(
             "Compute posterior uncertainty", value=True,
-            help="Adds roughly 3x to the runtime and produces P10/P90 impedance volumes.")
+            help="Produces P10/P90 impedance volumes. Computed by a Takahashi recursion on the "
+                 "band of the inverse, so the cost stays linear in trace length.")
+
+        with st.expander("Lateral coupling — solve the traces together"):
+            st.caption(
+                "Every engine here treats each trace as an independent 1D problem, so nothing "
+                "stops neighbours disagreeing by more than the seismic can justify — which is "
+                "what vertical striping in a noisy section actually is. Adding a lateral "
+                "roughness term to the joint prior couples them; the solve is a block "
+                "Gauss-Seidel sweep, so it costs one 1D run per sweep. Zero reproduces the "
+                "independent result exactly.")
+            k1, k2 = st.columns(2)
+            params["_lateral_weight"] = k1.slider("Lateral weight", 0.0, 3.0, 0.0, 0.1,
+                                                  help="Relative to the prior precision.")
+            params["_n_sweeps"] = k2.slider("Sweeps", 1, 6, 3, 1)
         if wav is None:
             ready, blockers = False, blockers + ["a wavelet (" + step_ref("wavelet") + ")"]
         if model is None:
@@ -1599,15 +1774,28 @@ def page_inversion() -> None:
 
     if c2.button("Estimate full-volume runtime", width="stretch"):
         with st.spinner("Timing a few traces..."):
-            secs = inversion.estimate_runtime(vol, method, wav_samples, model, **params)
+            timing = {k: v for k, v in params.items() if not k.startswith("_")}
+            secs = inversion.estimate_runtime(vol, method, wav_samples, model, **timing)
+            sweeps = params.get("_n_sweeps", 1) if params.get("_lateral_weight", 0) else 1
+            secs *= max(int(sweeps), 1)
         st.info(f"Estimated full volume ({vol.n_traces:,} traces): "
                 f"**{secs:.0f} s** ({secs / 60:.1f} min).")
 
     if c3.button("Run full volume", width="stretch"):
-        st.session_state.job = BackgroundJob(
-            inversion.run_volume, volume=vol, method=method, wavelet=wav_samples,
-            low_freq_model=model, **params)
-        log(f"full-volume {method} started")
+        resolved = resolve_params(vol, method, wav_samples, params)
+        lateral = resolved.pop("_lateral_weight", 0.0)
+        sweeps = resolved.pop("_n_sweeps", 3)
+        if method == "bayesian" and lateral and lateral > 0:
+            st.session_state.job = BackgroundJob(
+                inversion.coupled_bayesian_volume, volume=vol, wavelet=wav_samples,
+                low_freq_model=model, lateral_weight=float(lateral), n_sweeps=int(sweeps),
+                **resolved)
+            log(f"full-volume coupled bayesian started (lateral {lateral}, {sweeps} sweeps)")
+        else:
+            st.session_state.job = BackgroundJob(
+                inversion.run_volume, volume=vol, method=method, wavelet=wav_samples,
+                low_freq_model=model, **resolved)
+            log(f"full-volume {method} started")
         st.rerun()
 
     _poll_job()
@@ -1656,10 +1844,44 @@ def _coloured_controls(vol, ties, params):
     return params, True, []
 
 
+def resolve_params(vol, method, wav_samples, params: dict) -> dict:
+    """Turn the UI's private ``_`` options into engine arguments.
+
+    Kept separate so both the inline preview and the background job go through
+    exactly the same resolution -- a sparsity chosen for the preview and then
+    silently dropped from the full run would be worse than not offering it.
+    """
+    params = dict(params)
+    noise = params.pop("_auto_sparsity", None)
+    if noise is not None and method == "sparse-spike":
+        flat = vol.flat_data()
+        live = flat[vol.live_mask()]
+        picked = inversion.select_sparsity(
+            live if live.size else flat, wav_samples, dt=vol.dt, noise_pct=float(noise),
+            n_iter=int(params.get("n_iter", 12)))
+        st.session_state.auto_sparsity_result = picked
+        params["sparsity"] = picked["sparsity"]
+        log(f"auto sparsity {picked['sparsity']:.4g} ({picked['note']})")
+    return params
+
+
 def _run_inline(vol, method, wav_samples, model, params, il_range, xl_range, label: str) -> None:
     """Foreground run for the (small) preview block, with a progress bar."""
     bar = st.progress(0.0, text="Inverting...")
     try:
+        params = resolve_params(vol, method, wav_samples, params)
+        lateral = params.pop("_lateral_weight", 0.0)
+        sweeps = params.pop("_n_sweeps", 3)
+        if method == "bayesian" and lateral and lateral > 0:
+            result = inversion.coupled_bayesian_volume(
+                vol, wav_samples, model, lateral_weight=float(lateral), n_sweeps=int(sweeps),
+                il_range=il_range, xl_range=xl_range,
+                progress=lambda f, m: bar.progress(min(f, 1.0), text=f"Coupled... {m}"), **params)
+            bar.empty()
+            st.session_state.result = result
+            log(f"{label} coupled bayesian: {result.elapsed_s:.1f}s")
+            flash(f"{label.capitalize()} complete in {result.elapsed_s:.1f} s (laterally coupled).")
+            return
         result = inversion.run_volume(
             vol, method, wav_samples, model, il_range=il_range, xl_range=xl_range,
             progress=lambda f, m: bar.progress(min(f, 1.0), text=f"Inverting... {m}"), **params)
@@ -1711,9 +1933,13 @@ def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -
     trace = vol.trace_at(tie.il_index, tie.xl_index)
     lf_trace = model.trace(tie.il_index, tie.xl_index) if model is not None else None
 
+    clean = {k: v for k, v in params.items() if not k.startswith("_")}
+    if "_auto_sparsity" in params and "sparsity" not in clean:
+        prior = st.session_state.get("auto_sparsity_result")
+        clean["sparsity"] = float(prior["sparsity"]) if prior else 0.15
     try:
         res = inversion.invert(trace, wav_samples, lf_trace, method=method,
-                               dt=vol.dt, **params)
+                               dt=vol.dt, **clean)
     except Exception as exc:  # noqa: BLE001
         show_error(exc, "Single-trace inversion failed")
         return
@@ -1747,6 +1973,211 @@ def _show_single_trace_qc(vol, ties, method, wav_samples, model, params, gate) -
             f"(prior {res['prior_std']:.3f}); the answer sits at most "
             f"{res['prior_drift']:.2f} log units from the background model."
         )
+
+    if method == "bayesian" and lf_trace is not None:
+        with st.expander("Stochastic realisations at this well"):
+            st.caption(
+                "The point estimate is the posterior *mean*: smooth, and by construction the one "
+                "model no realisation looks like. These are exact independent draws from the same "
+                "posterior — each is consistent with the seismic and the prior, and their spread "
+                "is the uncertainty. Each costs one triangular solve, so there is no sampler to "
+                "tune and no burn-in to argue about.")
+            r1, r2 = st.columns(2)
+            n_real = r1.slider("Realisations", 5, 200, 30, 5)
+            seed = r2.number_input("Seed", 0, 10_000, 0, 1)
+            if st.button("Draw realisations"):
+                draw_params = {k: v for k, v in clean.items()
+                               if k in ("prior_std", "smoothness", "noise_pct")}
+                try:
+                    draws = inversion.bayesian_realisations(
+                        trace, wav_samples, lf_trace, n_realisations=int(n_real),
+                        seed=int(seed), dt=vol.dt, **draw_params)
+                    st.session_state.realisations = (pick, draws)
+                except ValueError as exc:
+                    st.error(str(exc))
+            stored = st.session_state.get("realisations")
+            if stored and stored[0] == pick:
+                draws = stored[1]
+                st.plotly_chart(
+                    viz.realisations_figure(draws, vol.twt, tie.ai, gate),
+                    width="stretch")
+                st.caption(f"{draws['n_realisations']} draws; mean spread "
+                           f"{draws['spread']:.4f} in log-impedance.")
+
+
+# ==========================================================================
+# Blind validation
+# ==========================================================================
+
+def page_validation() -> None:
+    st.header(step_header("validation"))
+    vol, wells = st.session_state.volume, st.session_state.wells
+    wav = st.session_state.wavelet
+    if vol is None or not wells:
+        st.info("Load a volume and some wells on " + step_ref("data") + " first.")
+        return
+    if wav is None:
+        st.info("Build a wavelet on " + step_ref("wavelet") + " first.")
+        return
+
+    located = [w for w in wells if w.has_location]
+    st.caption(
+        "Scoring an inversion at a well that helped build its own background model measures the "
+        "background model. This holds each well out, rebuilds the low-frequency model without it, "
+        "inverts, and scores against the log the model never saw — the only version of the number "
+        "worth showing anyone."
+    )
+    if len(located) < 2:
+        st.warning(
+            f"Blind validation needs at least two located wells; there {'is' if len(located) == 1 else 'are'} "
+            f"{len(located)}. With one well, holding it out leaves nothing to build a background from — "
+            "which is exactly why a single-well score cannot be blind.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    methods = c1.multiselect("Engines", [m for m in inversion.METHODS if m != "coloured"],
+                             default=["model-based", "bayesian"],
+                             help="Coloured inversion needs a designed operator and is scored on "
+                                  + step_ref("inversion") + " instead.")
+    cutoff = c2.slider("Background cutoff (Hz)", 2.0, 20.0,
+                       float(getattr(st.session_state.lfm, "cutoff_hz", 10.0)), 0.5)
+    hi = c3.slider("Score band upper (Hz)", 20.0, 90.0, 60.0, 5.0)
+
+    if st.button("Run blind validation", type="primary") and methods:
+        bar = st.progress(0.0, text="cross-validating")
+        out = {}
+        for i, method in enumerate(methods):
+            try:
+                out[method] = crossval.leave_one_out(
+                    vol, wells, wav.samples, method=method, cutoff_hz=float(cutoff),
+                    band=(float(cutoff), float(hi)))
+            except ValueError as exc:
+                st.error(str(exc))
+            bar.progress((i + 1) / len(methods), text=f"cross-validated {method}")
+        bar.empty()
+        st.session_state.crossval = out
+        log(f"blind validation over {len(out)} engine(s)")
+
+    results = st.session_state.get("crossval") or {}
+    if not results:
+        st.info("Nothing validated yet.")
+        return
+
+    summary = pd.DataFrame([cv.summary() for cv in results.values()])
+    st.subheader("Verdict")
+    st.dataframe(summary, hide_index=True, width="stretch")
+    st.caption(
+        "**Uplift** is the correlation the inversion added over its own background, at wells it "
+        "had not seen. An engine that cannot beat its background here has added nothing, however "
+        "good the section looks.")
+
+    for method, cv in results.items():
+        with st.expander(f"{method} — per-well detail", expanded=len(results) == 1):
+            st.dataframe(pd.DataFrame(cv.table()), hide_index=True, width="stretch")
+            for note in cv.notes:
+                st.caption(note)
+            failed = [sc for sc in cv.scores if sc.note and not np.isfinite(sc.corr_band)]
+            for sc in failed:
+                st.warning(f"{sc.well}: {sc.note}")
+
+
+# ==========================================================================
+# Rock property
+# ==========================================================================
+
+def page_property() -> None:
+    st.header(step_header("property"))
+    vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
+    result = st.session_state.result
+    if vol is None or not wells:
+        st.info("Load a volume and some wells on " + step_ref("data") + " first.")
+        return
+    if result is None or result.absolute_ai is None:
+        st.info("Run an inversion that produces absolute impedance on " + step_ref("inversion") + " first.")
+        return
+
+    st.caption(
+        "Impedance is an intermediate quantity — nobody drills on it. This fits a transform from "
+        "log-impedance to a well curve, applies it to the cube, and carries the uncertainty "
+        "through, so a cut-off returns a probability instead of a falsely confident yes or no."
+    )
+
+    curves = sorted({m for w in wells for m in w.curves})
+    if not curves:
+        st.warning("No well curves are loaded to calibrate against.")
+        return
+    c1, c2, c3 = st.columns(3)
+    mnemonic = c1.selectbox("Well curve", curves,
+                            index=curves.index("PHIT") if "PHIT" in curves else 0)
+    degree = c2.slider("Polynomial degree in ln(AI)", 1, 3, 1)
+    gate = get_gate()
+
+    if c3.button("Fit transform", type="primary"):
+        try:
+            fit = rockphysics.fit_property(vol, wells, mnemonic, degree=int(degree),
+                                           gate=gate, ties=ties)
+            st.session_state.property_fit = fit
+            st.session_state.property_cube = None
+            log(f"fitted {mnemonic} against impedance (R^2 {fit.r_squared:.2f})")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    fit = st.session_state.get("property_fit")
+    if fit is None:
+        st.info("No transform fitted yet.")
+        return
+
+    st.subheader("Transform")
+    st.dataframe(kv_table(fit.summary()), width="stretch", hide_index=True)
+    for note in fit.notes:
+        st.warning(note)
+
+    points = rockphysics.crossplot_points(vol, wells, fit.property_name, gate=gate, ties=ties)
+    if points:
+        st.plotly_chart(viz.property_fit_figure(points, fit), width="stretch")
+
+    st.divider()
+    st.subheader("Apply to the cube")
+    have_posterior = result.posterior_std is not None
+    if not have_posterior:
+        st.caption("This result carries no posterior, so the only uncertainty available is the "
+                   "scatter of the wells about the transform. Run the Bayesian engine with "
+                   "uncertainty on to include what the seismic did not resolve.")
+    if st.button("Predict property cube"):
+        out = rockphysics.apply_fit(result.absolute_ai, fit,
+                                    posterior_std=result.posterior_std if have_posterior else None)
+        st.session_state.property_cube = out
+        log(f"predicted {fit.property_name} cube ({out['uncertainty_source']})")
+
+    cube = st.session_state.get("property_cube")
+    if cube is None:
+        return
+
+    prop = cube["property"]
+    st.caption(f"Uncertainty source: {cube['uncertainty_source']}; mean sigma "
+               f"{float(np.mean(cube['sigma'])):.4g}")
+    lo, hi = float(np.nanpercentile(prop, 1)), float(np.nanpercentile(prop, 99))
+    thr = st.slider(f"Cut-off on {fit.property_name}", lo, hi, float(np.nanmedian(prop)),
+                    (hi - lo) / 100 if hi > lo else 0.01)
+    below = st.checkbox("Count values *below* the cut-off instead", value=False)
+
+    prob = rockphysics.probability_above(prop, cube["sigma"], thr, below=below)
+    thickness = rockphysics.expected_thickness(prob, vol.sample_rate_ms)
+    hard = (prop < thr if below else prop > thr).sum(axis=2) * vol.sample_rate_ms
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Expected net thickness", f"{float(np.mean(thickness)):.0f} ms",
+              help="Probability summed down each trace, then averaged over the map.")
+    m2.metric("Hard-threshold thickness", f"{float(np.mean(hard)):.0f} ms",
+              help="Counting only samples whose single best estimate clears the cut-off.")
+    m3.metric("Samples genuinely uncertain", f"{float(np.mean((prob > 0.05) & (prob < 0.95))):.0%}",
+              help="Where the probability is neither near 0 nor near 1 — the seismic does not "
+                   "resolve which side of the cut-off the rock falls.")
+
+    st.plotly_chart(viz.qc_map_figure(thickness, vol.iline, vol.xline,
+                                      title="Expected net thickness past the cut-off (ms)"),
+                    width="stretch")
+    st.session_state.property_probability = prob
 
 
 # ==========================================================================
@@ -1961,6 +2392,8 @@ def main() -> None:
         "wavelet": page_wavelet,
         "lfm": page_low_freq,
         "inversion": page_inversion,
+        "validation": page_validation,
+        "property": page_property,
         "results": page_results,
     }
     routes[PAGES[STEPS.index(step)][0]]()
