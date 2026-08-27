@@ -17,12 +17,17 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (BaseDocTemplate, Frame, KeepTogether, NextPageTemplate,
-                                PageBreak, PageTemplate, Paragraph, Spacer, Table,
-                                TableStyle)
+from reportlab.platypus import (BaseDocTemplate, Frame, Image, KeepTogether,
+                                NextPageTemplate, PageBreak, PageTemplate, Paragraph,
+                                Spacer, Table, TableStyle)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guide_content as C  # noqa: E402
+
+# Screenshots are optional: the guide has to build on a machine that has never
+# run the app, so a missing image is a skipped figure and a note, not a crash.
+SHOT_DIR = os.environ.get(
+    "GUIDE_SHOTS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "shots"))
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 pdfmetrics.registerFont(TTFont("DJV", f"{FONT_DIR}/DejaVuSans.ttf"))
@@ -167,6 +172,54 @@ def render_blocks(blocks, story):
         elif kind == "resulttable":
             story.append(result_table())
             story.append(Spacer(1, 6))
+        elif kind == "figure":
+            fig = figure(block[1], block[2], block[3],
+                         max_w=block[4] if len(block) > 4 else 1.0,
+                         max_h=block[5] if len(block) > 5 else 118 * mm)
+            if fig is not None:
+                story.append(fig)
+
+
+def figure(name, cap_en, cap_ru, max_w=1.0, max_h=118 * mm):
+    """A screenshot with a bilingual caption, scaled to fit the text column.
+
+    Returned as a KeepTogether so a caption never orphans onto the next page
+    from the picture it describes.
+    """
+    path = name if os.path.isabs(name) else os.path.join(SHOT_DIR, name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        from reportlab.lib.utils import ImageReader
+        iw, ih = ImageReader(path).getSize()
+    except Exception:  # noqa: BLE001 - unreadable image is a skipped figure
+        return None
+    if not iw or not ih:
+        return None
+
+    target_w = BODY_W * max_w
+    scale = min(target_w / iw, max_h / ih)
+    w, h = iw * scale, ih * scale
+
+    img = Image(path, width=w, height=h)
+    frame = Table([[img]], colWidths=[w])
+    frame.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.5, RULE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    holder = Table([[frame]], colWidths=[BODY_W])
+    holder.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    caption = two_col(para(cap_en, "small"), para(cap_ru, "small"))
+    return KeepTogether([holder, caption, Spacer(1, 8)])
 
 
 def rule(colour=RULE, thickness=0.6, space=5):
