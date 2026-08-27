@@ -32,6 +32,26 @@ have a real label rather than for a fixed timeout; and Streamlit dataframes
 render to canvas, so their `inner_text` is empty and they can only be told apart
 by counting how many appear after an action.
 
+## The mark
+
+The logo — impedance layers of unequal thickness with a single trace running
+through them — is drawn as vector by `draw_mark()` in `build_guide.py`, on the
+cover at 26 mm and in every running header at 4.4 mm. It is code rather than an
+embedded image because the header instance is small enough that a raster would
+have to be absurdly oversampled to stay clean, and because the cover and the
+header are then guaranteed to be the same shape.
+
+On the navy cover the four bars separate by lightness rather than hue: two
+blues at similar opacity collapsed into one grey mass at 26 mm.
+
+```bash
+python build_guide.py --svg      # writes brand/logo.svg and brand/logo-dark.svg
+```
+
+Those SVGs are generated from the same geometry, so a slide or a poster can use
+the logo without anyone redrawing it by eye. Edit the shape in `build_guide.py`
+and re-export; do not hand-edit the SVGs.
+
 ## Terminology
 
 `terminology_ru.tsv` records the Russian term agreed for each English one,

@@ -451,12 +451,67 @@ def workflow_map():
 # Page furniture
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# The mark
+# --------------------------------------------------------------------------
+
+# Impedance layers of unequal thickness with a single trace running through
+# them.  Drawn as vector rather than placed as an image: it appears on every
+# page at 4.6 mm, where a raster would have to be embedded at absurd resolution
+# to stay clean, and this way it is also the same geometry at 30 mm on the
+# cover.  Coordinates are the SVG source's 64x64 box (y downwards); _to() flips
+# them into PDF space.
+_LAYERS = [  # x, y, width, height, colour, opacity
+    (4, 8, 56, 11, "#1f4e79", 0.92),
+    (4, 23, 56, 7, "#4f81bd", 0.85),
+    (4, 34, 56, 14, "#1f4e79", 0.55),
+    (4, 52, 56, 6, "#4f81bd", 0.40),
+]
+# On the navy cover the four bars have to separate by *lightness*, not by hue:
+# two blues at similar opacity turned into one grey mass at 30 mm.
+_LAYERS_DARK = [
+    (4, 8, 56, 11, "#f2f6fa", 0.95),
+    (4, 23, 56, 7, "#93b7dc", 0.90),
+    (4, 34, 56, 14, "#f2f6fa", 0.55),
+    (4, 52, 56, 6, "#93b7dc", 0.45),
+]
+# M30 4 C40 12 22 20 32 28 C42 36 24 44 32 52 C36 56 32 58 30 60
+_TRACE = [(30, 4), (40, 12, 22, 20, 32, 28), (42, 36, 24, 44, 32, 52), (36, 56, 32, 58, 30, 60)]
+
+
+def draw_mark(canvas, x, y, size, dark=False):
+    """Draw the logo with its bottom-left corner at (x, y), ``size`` wide."""
+    k = size / 64.0
+
+    def _to(px, py):
+        return x + px * k, y + (64 - py) * k
+
+    canvas.saveState()
+    for lx, ly, lw, lh, hexcolour, alpha in (_LAYERS_DARK if dark else _LAYERS):
+        c = colors.HexColor(hexcolour)
+        canvas.setFillColor(colors.Color(c.red, c.green, c.blue, alpha=alpha))
+        px, py = _to(lx, ly + lh)
+        canvas.roundRect(px, py, lw * k, lh * k, 2.5 * k, fill=1, stroke=0)
+
+    path = canvas.beginPath()
+    path.moveTo(*_to(*_TRACE[0]))
+    for c1x, c1y, c2x, c2y, ex, ey in _TRACE[1:]:
+        path.curveTo(*_to(c1x, c1y), *_to(c2x, c2y), *_to(ex, ey))
+    canvas.setStrokeColor(colors.HexColor("#e0736d" if dark else "#c0504d"))
+    canvas.setLineWidth(3.6 * k)
+    canvas.setLineCap(1)
+    canvas.setLineJoin(1)
+    canvas.drawPath(path)
+    canvas.restoreState()
+
+
 def cover_page(canvas, doc):
     canvas.saveState()
     canvas.setFillColor(colors.HexColor("#16283c"))
     canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
     canvas.setFillColor(ACCENT)
     canvas.rect(0, PAGE_H - 118 * mm, PAGE_W, 3, fill=1, stroke=0)
+    draw_mark(canvas, MARGIN, PAGE_H - 58 * mm, 26 * mm, dark=True)
     # A quiet reference to a seismic section: stacked sinusoidal traces.
     canvas.setStrokeColor(colors.HexColor("#26405c"))
     canvas.setLineWidth(0.7)
@@ -477,9 +532,10 @@ def content_page(canvas, doc):
     canvas.setStrokeColor(RULE)
     canvas.setLineWidth(0.5)
     canvas.line(MARGIN, PAGE_H - MARGIN + 5 * mm, PAGE_W - MARGIN, PAGE_H - MARGIN + 5 * mm)
+    draw_mark(canvas, MARGIN, PAGE_H - MARGIN + 6.3 * mm, 4.4 * mm)
     canvas.setFont("DJV", 7)
     canvas.setFillColor(MUTED)
-    canvas.drawString(MARGIN, PAGE_H - MARGIN + 6.6 * mm,
+    canvas.drawString(MARGIN + 6.2 * mm, PAGE_H - MARGIN + 6.6 * mm,
                       "Post-Stack Seismic Inversion — user guide")
     canvas.drawRightString(PAGE_W - MARGIN, PAGE_H - MARGIN + 6.6 * mm,
                            "Инверсия суммарных сейсмических данных — руководство")
@@ -592,6 +648,34 @@ def build(out_path):
     return out_path
 
 
+def write_svg(path, dark=False):
+    """Export the mark as SVG, from the geometry the PDF draws.
+
+    Exists so a slide or a poster can use the same logo without anyone
+    redrawing it by eye -- there is one definition of the shape, above.
+    """
+    layers = _LAYERS_DARK if dark else _LAYERS
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" '
+             'width="64" height="64">']
+    for lx, ly, lw, lh, hexcolour, alpha in layers:
+        parts.append(f'  <rect x="{lx}" y="{ly}" width="{lw}" height="{lh}" rx="2.5" '
+                     f'fill="{hexcolour}" opacity="{alpha}"/>')
+    d = f"M{_TRACE[0][0]} {_TRACE[0][1]}" + "".join(
+        f" C{a} {b} {c} {e} {f} {g}" for a, b, c, e, f, g in _TRACE[1:])
+    parts.append(f'  <path d="{d}" fill="none" stroke="'
+                 f'{"#e0736d" if dark else "#c0504d"}" stroke-width="3.6" '
+                 'stroke-linecap="round" stroke-linejoin="round"/>')
+    parts.append("</svg>\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(parts))
+    return path
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--svg":
+        os.makedirs("brand", exist_ok=True)
+        print("written:", write_svg("brand/logo.svg"))
+        print("written:", write_svg("brand/logo-dark.svg", dark=True))
+        raise SystemExit(0)
     out = sys.argv[1] if len(sys.argv) > 1 else "guide.pdf"
     print("written:", build(out))
