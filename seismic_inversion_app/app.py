@@ -22,8 +22,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from modules import (crossval, data_io, inversion, low_freq_model, rockphysics, utils,
-                     visualization as viz, wavelet as wvl, welltie)
+from modules import (crossval, data_io, inversion, low_freq_model, multiattribute,
+                     rockphysics, utils, visualization as viz, wavelet as wvl, welltie)
 
 st.set_page_config(page_title="Post-Stack Seismic Inversion", page_icon="~", layout="wide")
 
@@ -74,6 +74,10 @@ DEFAULTS = {
     "crossval": None,
     "property_fit": None,
     "property_cube": None,
+    "ma_model": None,
+    "ma_training": None,
+    "ma_attributes": None,
+    "ma_cube": None,
     "realisations": None,
     "nonstationary_wavelet": None,
     "q_estimate": None,
@@ -2087,22 +2091,36 @@ def page_validation() -> None:
 
 def page_property() -> None:
     st.header(step_header("property"))
-    vol, wells, ties = st.session_state.volume, st.session_state.wells, st.session_state.ties
-    result = st.session_state.result
+    vol, wells = st.session_state.volume, st.session_state.wells
     if vol is None or not wells:
         st.info("Load a volume and some wells on " + step_ref("data") + " first.")
         return
-    if result is None or result.absolute_ai is None:
-        st.info("Run an inversion that produces absolute impedance on " + step_ref("inversion") + " first.")
-        return
 
     st.caption(
-        "Impedance is an intermediate quantity — nobody drills on it. This fits a transform from "
-        "log-impedance to a well curve, applies it to the cube, and carries the uncertainty "
-        "through, so a cut-off returns a probability instead of a falsely confident yes or no."
+        "Impedance is an intermediate quantity — nobody drills on it. This step turns the "
+        "seismic into something a well actually measures, and carries the uncertainty through, "
+        "so a cut-off returns a probability instead of a falsely confident yes or no."
     )
 
-    curves = sorted({m for w in wells for m in w.curves})
+    route = st.radio(
+        "Route to the property", list(_PROPERTY_ROUTES), horizontal=True, key="property_route",
+        help="The transform goes through impedance, so it inherits what the inversion resolved "
+             "and nothing else. Multi-attribute prediction goes straight from the seismic to the "
+             "log and can pick up relations impedance alone misses — and can just as easily fit "
+             "noise, which is why it is judged on wells it never saw.")
+    _PROPERTY_ROUTES[route](vol, wells, st.session_state.ties)
+
+
+def _page_property_from_impedance(vol, wells, ties) -> None:
+    result = st.session_state.result
+    if result is None or result.absolute_ai is None:
+        st.info("Run an inversion that produces absolute impedance on "
+                + step_ref("inversion") + " first, or predict the curve straight from the "
+                "seismic with the multi-attribute route above.")
+        return
+    st.caption("A transform is fitted from log-impedance to a well curve and applied to the cube.")
+
+    curves = rockphysics.predictable_curves(wells)
     if not curves:
         st.warning("No well curves are loaded to calibrate against.")
         return
@@ -2128,7 +2146,7 @@ def page_property() -> None:
         return
 
     st.subheader("Transform")
-    st.dataframe(kv_table(fit.summary()), width="stretch", hide_index=True)
+    st.dataframe(kv_table(fit.summary()), width="stretch")
     for note in fit.notes:
         st.warning(note)
 
@@ -2152,12 +2170,21 @@ def page_property() -> None:
     cube = st.session_state.get("property_cube")
     if cube is None:
         return
+    _property_cutoff_block(vol, cube, fit.property_name)
 
+
+def _property_cutoff_block(vol, cube: dict, label: str) -> None:
+    """Cut-off, probability and net thickness — shared by both routes.
+
+    However the property was predicted, the question asked of it is the same,
+    and so is the honest answer: not "is this pay" but "how much of this trace
+    is past the cut-off, given what the data did not resolve".
+    """
     prop = cube["property"]
     st.caption(f"Uncertainty source: {cube['uncertainty_source']}; mean sigma "
                f"{float(np.mean(cube['sigma'])):.4g}")
     lo, hi = float(np.nanpercentile(prop, 1)), float(np.nanpercentile(prop, 99))
-    thr = st.slider(f"Cut-off on {fit.property_name}", lo, hi, float(np.nanmedian(prop)),
+    thr = st.slider(f"Cut-off on {label}", lo, hi, float(np.nanmedian(prop)),
                     (hi - lo) / 100 if hi > lo else 0.01)
     below = st.checkbox("Count values *below* the cut-off instead", value=False)
 
@@ -2178,6 +2205,154 @@ def page_property() -> None:
                                       title="Expected net thickness past the cut-off (ms)"),
                     width="stretch")
     st.session_state.property_probability = prob
+
+
+def _page_property_multiattribute(vol, wells, ties) -> None:
+    """Predict a log directly from seismic attributes (Hampson et al., 2001).
+
+    The whole method rests on one discipline: attributes are added while the
+    error on a *withheld well* keeps falling, and no further.  Training error
+    is not evidence -- it can only fall as attributes are added -- so the page
+    puts both curves in front of the user and refuses to hide the gap between
+    them.
+    """
+    st.caption(
+        "Attributes are added one at a time, each chosen because it lowers the error at a well "
+        "the fit has not seen. That is the only thing standing between this and an elaborate way "
+        "of memorising the wells, so read the validation curve, not the training fit."
+    )
+    if len(wells) < 2:
+        st.warning("This needs at least two wells: with one there is nothing to validate against.")
+        return
+    curves = rockphysics.predictable_curves(wells)
+    if not curves:
+        st.warning("No well curves are loaded to predict.")
+        return
+
+    result = st.session_state.result
+    have_ai = result is not None and result.absolute_ai is not None
+    gate = get_gate()
+
+    c1, c2, c3 = st.columns(3)
+    target = c1.selectbox("Well curve to predict", curves, key="ma_target",
+                          index=curves.index("PHIT") if "PHIT" in curves else 0)
+    operator = c2.select_slider(
+        "Operator length (samples)", options=[1, 3, 5, 7, 9], value=5, key="ma_operator",
+        help="Each attribute is read over a window centred on the sample being predicted, not "
+             "at the sample alone. A log responds to a bed, and a seismic sample responds to "
+             "everything within a wavelet of it, so the two only line up over a window.")
+    max_attr = c3.slider(
+        "Attribute limit", 1, 10, 6, key="ma_max",
+        help="An upper bound, not a target. Selection stops early whenever the validation error "
+             "stops improving, and the page says so if it hits this limit still falling.")
+
+    d1, d2, d3 = st.columns(3)
+    kind = d1.radio("Model", ["Linear", "Neural net"], horizontal=True, key="ma_kind",
+                    help="The linear operator is the classical method. The network can fit a "
+                         "curved relation, and is fitted on the attributes the linear selection "
+                         "chose so the two are compared on equal footing.")
+    hidden = d2.slider("Hidden units", 2, 16, 8, key="ma_hidden",
+                       disabled=kind == "Linear")
+    use_ai = d3.checkbox("Add the inverted impedance as an attribute", value=have_ai,
+                         disabled=not have_ai, key="ma_use_ai",
+                         help="Inversion output makes a strong attribute: it already carries the "
+                              "low frequencies the seismic does not." if have_ai else
+                              "Run an inversion first to offer its impedance as an attribute.")
+
+    if st.button("Fit predictor", type="primary"):
+        try:
+            with st.spinner("Computing attribute cubes..."):
+                external = ({"inverted impedance": np.asarray(result.absolute_ai, dtype=float)}
+                            if use_ai and have_ai else None)
+                attributes = multiattribute.compute_attributes(vol, external=external)
+                train = multiattribute.gather_training(vol, wells, target, attributes,
+                                                       gate=gate, ties=ties)
+            with st.spinner("Selecting attributes by blind-well error..."):
+                model = multiattribute.fit_multi_attribute(
+                    train, operator_half=int(operator) // 2, max_attributes=int(max_attr),
+                    kind="mlp" if kind == "Neural net" else "linear", hidden=int(hidden))
+            st.session_state.ma_model = model
+            st.session_state.ma_training = train
+            # Only the chosen attributes are kept: holding every cube would multiply the
+            # volume in memory by the length of the attribute list for no further use.
+            st.session_state.ma_attributes = {a: attributes[a] for a in model.attributes}
+            st.session_state.ma_cube = None
+            log(f"fitted {model.kind} predictor for {target}: {model.n_used} attributes, "
+                f"validation RMS {model.validation_rms[model.n_used - 1]:.4g}")
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            st.error(str(exc))
+
+    model = st.session_state.get("ma_model")
+    if model is None:
+        st.info("No predictor fitted yet.")
+        return
+
+    st.subheader("Predictor")
+    st.dataframe(kv_table(model.summary()), width="stretch")
+    for note in model.notes:
+        st.warning(note)
+
+    m1, m2 = st.columns(2)
+    val = model.validation_rms[model.n_used - 1]
+    m1.metric("Validation error", f"{val:.4g}",
+              delta=f"{model.overfitting_gap:+.3g} vs training", delta_color="inverse",
+              help="RMS error at a well the fit never saw, and the amount by which it exceeds "
+                   "the training error. A large gap is memorisation.")
+    m2.metric("Against predicting the mean", f"{val / max(model.target_std, 1e-12):.2f}",
+              help="Validation error divided by the spread of the curve itself. Below 1 the "
+                   "seismic is carrying information about this property; at or above 1 it is not.")
+
+    st.plotly_chart(viz.attribute_error_figure(multiattribute.validation_curve(model)),
+                    width="stretch")
+    st.caption("Selection order: " + ", ".join(
+        f"**{a}**" if a in model.attributes else a for a in model.order))
+
+    train = st.session_state.get("ma_training")
+    if train is not None and model.wells:
+        with st.expander("Predicted against measured, well by well"):
+            st.caption("The final model is fitted on every well, so these panels show the fit, "
+                       "not a blind test. The blind numbers are the ones above.")
+            name = st.selectbox("Well", model.wells, key="ma_well")
+            if name in train.per_well:
+                pred = model.predict_traces(train.per_well[name])
+                st.plotly_chart(viz.attribute_prediction_figure(
+                    pred, train.targets[name], vol.twt, name, model.target,
+                    mask=train.masks.get(name)), width="stretch")
+
+    st.divider()
+    st.subheader("Apply to the cube")
+    st.caption("The uncertainty carried forward is the blind-well validation error, held constant "
+               "over the cube. It is what this predictor missed at a well it had never seen, "
+               "which is the only error bar a data-driven fit has earned.")
+    if st.button("Predict property cube"):
+        bar = st.progress(0.0, text="predicting")
+        try:
+            pred = multiattribute.predict_cube(
+                model, st.session_state.ma_attributes,
+                progress=lambda f, m: bar.progress(min(f, 1.0), text=f"predicting... {m}"))
+        except ValueError as exc:
+            bar.empty()
+            st.error(str(exc))
+            return
+        bar.empty()
+        st.session_state.ma_cube = {
+            "property": pred,
+            "sigma": np.full(pred.shape, val, dtype=np.float32),
+            "uncertainty_source": f"blind-well validation error ({val:.4g})",
+        }
+        log(f"predicted {model.target} cube from {model.n_used} attributes")
+
+    cube = st.session_state.get("ma_cube")
+    if cube is None:
+        return
+    _property_cutoff_block(vol, cube, model.target)
+
+
+# Route label -> handler.  Defined after both handlers so the names resolve.
+_PROPERTY_ROUTES = {
+    "From impedance (rock-physics transform)": _page_property_from_impedance,
+    "From seismic attributes (multi-attribute)": _page_property_multiattribute,
+}
 
 
 # ==========================================================================

@@ -1187,3 +1187,75 @@ def nonstationary_wavelet_figure(nsw, height: int = 460) -> go.Figure:
                       margin=dict(l=60, r=20, t=55, b=45),
                       legend=dict(orientation="h", y=-0.18))
     return fig
+
+
+def attribute_error_figure(curve: dict, height: int = 460) -> go.Figure:
+    """Training and validation error against the number of attributes.
+
+    This is the whole argument of multi-attribute prediction in one panel.
+    Training error can only fall as attributes are added -- it is not evidence
+    of anything.  Validation error, measured on wells the fit never saw, turns
+    back up once the extra freedom starts memorising rather than learning, and
+    where it turns is where the model should stop.  The dashed line at the
+    spread of the target is the error you would get by predicting the mean
+    everywhere: a validation curve that never drops clearly below it means the
+    seismic is not carrying the property, however good the training fit looks.
+    """
+    n = curve["n_attributes"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=n, y=curve["training"], mode="lines+markers", name="training",
+                             line=dict(color="#4f81bd", width=2.4), marker=dict(size=7)))
+    fig.add_trace(go.Scatter(x=n, y=curve["validation"], mode="lines+markers",
+                             name="validation (blind well)",
+                             line=dict(color="#c0504d", width=2.4), marker=dict(size=7)))
+    spread = float(curve.get("target_std") or 0.0)
+    if spread > 0:
+        fig.add_hline(y=spread, line=dict(color="#666666", width=1.4, dash="dash"),
+                      annotation_text="predicting the mean", annotation_position="top right")
+    chosen = int(curve.get("chosen") or 0)
+    if chosen:
+        fig.add_vline(x=chosen, line=dict(color="#111111", width=1.4, dash="dot"),
+                      annotation_text=f"chosen: {chosen}", annotation_position="bottom right")
+    top = max([spread] + list(curve["validation"]) + list(curve["training"])) * 1.15
+    fig.update_layout(
+        title="Where to stop adding attributes",
+        template=_TEMPLATE, height=height,
+        xaxis_title="number of attributes", yaxis_title="RMS prediction error",
+        xaxis=dict(dtick=1), yaxis=dict(range=[0, top]),
+        margin=dict(l=65, r=20, t=55, b=50),
+        legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
+def attribute_prediction_figure(predicted: np.ndarray, target: np.ndarray, twt: np.ndarray,
+                                name: str, label: str, mask=None, height: int = 560) -> go.Figure:
+    """A predicted curve against the measured log at one well.
+
+    The view is cropped to the interval the model was trained over.  Outside it
+    the prediction is still computed -- the operator simply pads at the ends of
+    the trace -- and those padded tails run to values the log never takes, which
+    would squash the part worth looking at into a narrow band.
+    """
+    fig = go.Figure()
+    good = np.isfinite(target)
+    shown = good if mask is None else (good & np.asarray(mask, dtype=bool))
+    fig.add_trace(go.Scatter(x=target[good], y=twt[good], mode="lines", name="measured",
+                             line=dict(color="#111111", width=2.0)))
+    fig.add_trace(go.Scatter(x=predicted, y=twt, mode="lines", name="predicted",
+                             line=dict(color="#c0504d", width=1.8)))
+    yaxis = dict(autorange="reversed")
+    xaxis = {}
+    if shown.any():
+        lo_t, hi_t = float(twt[shown].min()), float(twt[shown].max())
+        pad_t = 0.02 * max(hi_t - lo_t, 1.0)
+        yaxis = dict(range=[hi_t + pad_t, lo_t - pad_t])
+        vals = np.concatenate([target[shown], np.asarray(predicted)[shown]])
+        lo_v, hi_v = float(np.min(vals)), float(np.max(vals))
+        pad_v = 0.05 * max(hi_v - lo_v, 1e-9)
+        xaxis = dict(range=[lo_v - pad_v, hi_v + pad_v])
+    fig.update_layout(title=f"{label} at {name}", template=_TEMPLATE, height=height,
+                      xaxis_title=label, yaxis_title="TWT (ms)",
+                      yaxis=yaxis, xaxis=xaxis,
+                      margin=dict(l=65, r=20, t=55, b=50),
+                      legend=dict(orientation="h", y=-0.13))
+    return fig

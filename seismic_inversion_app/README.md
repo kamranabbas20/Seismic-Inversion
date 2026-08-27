@@ -1,10 +1,12 @@
 # Post-Stack Seismic Inversion
 
 A Streamlit application that loads 3D post-stack SEG-Y volumes and multi-well
-LAS logs, then inverts for acoustic impedance by one of three methods:
-**coloured inversion**, **sparse-spike inversion**, and **model-based
-inversion**. Results are viewable as sections, time slices and crossplots, and
-exportable as SEG-Y, NumPy or NetCDF.
+LAS logs, then inverts for acoustic impedance by one of four methods:
+**coloured inversion**, **sparse-spike inversion**, **model-based inversion**
+and **Bayesian linear inversion**. Impedance can then be turned into a rock
+property, either through a calibrated transform or by multi-attribute
+prediction from the seismic itself. Results are viewable as sections, time
+slices and crossplots, and exportable as SEG-Y, NumPy or NetCDF.
 
 ---
 
@@ -189,7 +191,7 @@ sensitive to tie and wavelet quality.
 | **7 - Low-frequency model** | Well AI low-pass filtered and interpolated between wells, optionally flattened on one horizon or proportionally between several. |
 | **8 - Inversion** | Four methods (coloured, sparse-spike, model-based, Bayesian), method-specific parameters, sparsity chosen from the noise level, optional lateral coupling, stochastic realisations, single-trace QC, preview on a subset, full-volume run. |
 | **9 - Blind validation** | Leave-one-out cross-validation: each well held out, the background rebuilt without it, and the inversion scored against a log it has never seen. |
-| **10 - Rock property** | Fit impedance to a well curve, predict it over the cube, and turn a cut-off into a probability and an expected net thickness. |
+| **10 - Rock property** | Two routes to a log-measurable property: a rock-physics transform from impedance, or multi-attribute prediction straight from the seismic. Either way a cut-off becomes a probability and an expected net thickness. |
 | **11 - Results & export** | Section viewer, time slice, per-trace QC maps, posterior uncertainty and P10/P90 where available, crossplot against well logs, export. |
 
 Step numbers are derived from one list in `app.py`, and every "see step N" in the
@@ -481,6 +483,68 @@ down a trace gives an expected net thickness that already accounts for how well
 the seismic resolved the impedance. Where the seismic constrained it tightly the
 probability sits near 0 or 1; where it did not, it drifts toward 0.5 instead of
 pretending to know.
+
+---
+
+## Multi-attribute prediction
+
+The transform above goes through impedance, so it can only carry what the
+inversion resolved. Step 10 offers a second route that goes straight from the
+seismic to the log: the classical multi-attribute method of Hampson, Schultz &
+Fehler (2001), in `modules/multiattribute.py`.
+
+Thirteen attributes are derived from the volume — amplitude, envelope,
+instantaneous phase and frequency, amplitude-weighted frequency, the integrated
+trace, first and second derivatives, four band-passed copies, and time itself —
+plus any external cube, for which the inverted impedance is the obvious
+candidate. Each is read through a short **convolutional operator** rather than
+sample by sample, because a log responds to a bed while a seismic sample
+responds to everything within a wavelet of it; the two only line up over a
+window.
+
+Attributes are then added one at a time by **forward stepwise selection**, and
+this is the part that matters:
+
+- at each step every remaining attribute is tried, and the one that lowers the
+  **validation** error most is kept;
+- validation error is measured leave-one-**well**-out — the model is refitted
+  without a well and scored against that well's log;
+- selection stops when validation error stops improving, whatever the training
+  error is doing.
+
+Training error can only fall as attributes are added. It is not evidence of
+anything, and a method that chose its size by training error would happily fit
+noise until it ran out of attributes. The app plots both curves against the
+number of attributes, with the spread of the target curve drawn across them:
+that dashed line is the error you would get by predicting the mean everywhere,
+so a validation curve that never drops clearly below it means the seismic is not
+carrying this property, however good the training fit looks.
+
+Three guards are stated in words rather than left for the user to spot:
+
+- validation error no better than predicting the mean — *"this model has learned
+  nothing that generalises to a well it has not seen"*;
+- validation error still falling when the attribute limit was reached — the
+  limit, not the data, chose the model size;
+- validation error far above training error — the extra freedom is being spent
+  on memorising.
+
+A **neural network** option is offered: one hidden tanh layer trained with Adam,
+fitted on the attributes the linear selection already chose, so the two are
+compared on equal footing. If it validates worse than the linear model, the app
+says so instead of presenting the more elaborate answer as the better one. Fits
+are refused outright with fewer than two wells, because with one well there is
+nothing to validate against.
+
+The uncertainty carried into the cut-off is the blind-well validation error,
+held constant over the cube. It is what the predictor missed at a well it had
+never seen, and it is the only error bar a data-driven fit has earned — unlike
+the impedance route, there is no posterior to propagate.
+
+Depth and time index curves (`DEPT`, `TWT`, `MD` …) are kept out of the target
+list on both routes. They are predicted almost perfectly by the `time`
+attribute and say nothing about the rock, so offering one invites a fit that
+looks excellent and means nothing.
 
 ---
 
@@ -859,6 +923,7 @@ seismic_inversion_app/
 │   ├── welltie.py            # bulk shift + stretch/squeeze optimiser
 │   ├── crossval.py           # blind leave-one-out validation
 │   ├── rockphysics.py        # impedance -> property, with uncertainty
+│   ├── multiattribute.py     # attribute selection by blind-well error, linear + MLP
 │   ├── visualization.py      # plotly sections, spectra, tie QC, crossplots
 │   └── utils.py              # units, filtering, geometry, impedance algebra
 ├── scripts/
@@ -889,7 +954,7 @@ otherwise:
 - **Automatic horizon interpretation.** Horizons are read from a CSV; nothing
   here picks them.
 
-Since the first version, five of the original non-goals have been closed and
+Since the first version, six of the original non-goals have been closed and
 are now documented above: stretch and squeeze, uncertainty quantification,
-non-stationary wavelets, multi-horizon proportional flattening, and
-deviated-well trace extraction.
+non-stationary wavelets, multi-horizon proportional flattening, deviated-well
+trace extraction, and multi-attribute / machine-learning prediction.

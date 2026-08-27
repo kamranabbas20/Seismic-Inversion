@@ -31,6 +31,28 @@ from . import utils
 # 1.2815515655446004 = the 90th percentile of a standard normal.
 Z90 = 1.2815515655446004
 
+# Depth and time index curves.  They are stored alongside the measurements but
+# they are not measurements: a "predicted depth" is reproduced perfectly by the
+# time attribute, or by any monotone function of impedance, and says nothing
+# about the rock.  Offering one as a target invites a fit that looks excellent
+# and means nothing, so they are kept off the list.
+INDEX_CURVES = frozenset({"DEPT", "DEPTH", "MD", "TVD", "TVDSS", "TVDKB",
+                          "TWT", "TIME", "OWT"})
+
+
+def predictable_curves(wells) -> list[str]:
+    """Well curves worth predicting from seismic, index curves left out.
+
+    The curve a well was assigned as its *time* channel is excluded too,
+    whatever it happens to be called: it may carry any mnemonic at all, and it
+    is still an index.
+    """
+    assigned = {str(getattr(getattr(w, "selection", None), "time", "") or "").upper()
+                for w in wells}
+    assigned.discard("")
+    return sorted({m for w in wells for m in getattr(w, "curves", {})
+                   if m.upper() not in INDEX_CURVES and m.upper() not in assigned})
+
 
 @dataclass
 class PropertyFit:

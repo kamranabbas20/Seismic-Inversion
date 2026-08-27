@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules import data_io, inversion, low_freq_model, utils  # noqa: E402
 from modules import visualization as viz  # noqa: E402
 from modules import wavelet as wvl  # noqa: E402
-from modules import crossval, rockphysics, welltie  # noqa: E402
+from modules import crossval, multiattribute, rockphysics, welltie  # noqa: E402
 
 GATE = (60.0, 520.0)
 
@@ -1585,6 +1585,197 @@ def test_non_stationary_wavelet_covers_every_time():
     pair = np.stack([nsw.wavelets[0], nsw.wavelets[1]])
     assert np.all(mid <= pair.max(axis=0) + 1e-9) and np.all(mid >= pair.min(axis=0) - 1e-9)
     assert np.isfinite(nsw.dominant_frequencies()).all()
+
+
+
+
+# ==========================================================================
+# Multi-attribute prediction
+# ==========================================================================
+
+def _attribute_dataset(target="PHIT", seed=3):
+    """Synthetic cube whose wells carry a curve that really depends on impedance."""
+    volume, wells = data_io.make_synthetic_dataset()
+    rng = np.random.default_rng(seed)
+    for well in wells:
+        ai = well.vp * well.rho
+        well.curves[target] = (0.30 - 0.028 * (np.log(np.clip(ai, 1.0, None)) - 15.2)
+                               + rng.normal(0.0, 0.012, ai.shape))
+        well.curve_units[target] = "v/v"
+    return volume, wells
+
+
+def test_attributes_cover_the_cube_and_stay_finite():
+    volume, _wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    assert len(attrs) >= 10, sorted(attrs)
+    for name, cube in attrs.items():
+        assert cube.shape == volume.data.shape, name
+        assert np.isfinite(cube).all(), f"{name} produced non-finite values"
+
+
+def test_external_attribute_must_match_the_cube():
+    volume, _wells = _attribute_dataset()
+    try:
+        multiattribute.compute_attributes(volume, external={"bad": np.zeros((2, 2, 2))})
+    except ValueError as exc:
+        assert "expected" in str(exc)
+    else:
+        raise AssertionError("a mis-shaped external attribute was accepted")
+
+
+def test_operator_matrix_holds_the_edges():
+    """A lag must never wrap the far end of the trace into view."""
+    trace = np.arange(10.0)
+    block = multiattribute._operator_matrix(trace, half=2)
+    assert block.shape == (10, 5)
+    assert np.allclose(block[0], [0, 0, 0, 1, 2]), block[0]
+    assert np.allclose(block[-1], [7, 8, 9, 9, 9]), block[-1]
+    assert np.allclose(multiattribute._operator_matrix(trace, 0).ravel(), trace)
+
+
+def test_multi_attribute_refuses_a_single_well():
+    """With one well there is nothing to validate against."""
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    train = multiattribute.gather_training(volume, wells[:1], "PHIT", attrs)
+    try:
+        multiattribute.fit_multi_attribute(train)
+    except ValueError as exc:
+        assert "two wells" in str(exc)
+    else:
+        raise AssertionError("a one-well multi-attribute fit was allowed")
+
+
+def test_multi_attribute_learns_a_real_relationship():
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    train = multiattribute.gather_training(volume, wells, "PHIT", attrs)
+    model = multiattribute.fit_multi_attribute(train, operator_half=2, max_attributes=6)
+    best = model.validation_rms[model.n_used - 1]
+    assert best < model.target_std, (best, model.target_std)
+    assert 1 <= model.n_used <= 6
+    assert model.attributes == model.order[:model.n_used]
+
+
+def test_unpredictable_target_is_reported_as_learning_nothing():
+    """The guard that matters: training error falls, validation refuses to.
+
+    A target with no relationship to the seismic can always be fitted better by
+    adding attributes.  Only the held-out-well error notices, and it must both
+    stop the selection early and say so in the notes.
+    """
+    volume, wells = _attribute_dataset()
+    rng = np.random.default_rng(11)
+    for well in wells:
+        well.curves["JUNK"] = rng.normal(0.0, 1.0, well.md.shape)
+    attrs = multiattribute.compute_attributes(volume)
+    train = multiattribute.gather_training(volume, wells, "JUNK", attrs)
+    model = multiattribute.fit_multi_attribute(train, operator_half=4, max_attributes=8)
+
+    assert model.training_rms[-1] < model.training_rms[0], "training error should fall"
+    assert model.validation_rms[-1] > model.validation_rms[0], \
+        "validation error should rise on an unpredictable target"
+    assert model.validation_rms[model.n_used - 1] >= 0.95 * model.target_std
+    assert any("learned nothing" in n for n in model.notes), model.notes
+
+
+def test_validation_holds_out_whole_wells():
+    """Leaving out a well must change the fit; leaving out samples would not."""
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    full = multiattribute.gather_training(volume, wells, "PHIT", attrs)
+    fewer = multiattribute.gather_training(volume, wells[:3], "PHIT", attrs)
+    a = multiattribute.fit_multi_attribute(full, operator_half=1, max_attributes=4)
+    b = multiattribute.fit_multi_attribute(fewer, operator_half=1, max_attributes=4)
+    assert a.wells != b.wells
+    assert len(a.wells) == 4 and len(b.wells) == 3
+
+
+def test_predicted_cube_matches_the_geometry_and_the_wells():
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    train = multiattribute.gather_training(volume, wells, "PHIT", attrs)
+    model = multiattribute.fit_multi_attribute(train, operator_half=1, max_attributes=3)
+    cube = multiattribute.predict_cube(model, attrs)
+    assert cube.shape == volume.data.shape
+    assert np.isfinite(cube).all()
+
+    # At a well, the cube must equal what the model predicts from that well's
+    # own attribute traces -- otherwise the cube and the fit disagree.
+    ties = data_io.extract_well_traces(volume, wells, k=4)
+    tie = ties[0]
+    traces = {a: attrs[a][tie.il_index, tie.xl_index, :] for a in model.attributes}
+    assert np.allclose(cube[tie.il_index, tie.xl_index, :],
+                       model.predict_traces(traces), atol=1e-4)
+
+
+def test_network_is_reported_when_it_validates_worse():
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    train = multiattribute.gather_training(volume, wells, "PHIT", attrs)
+    model = multiattribute.fit_multi_attribute(train, operator_half=1, max_attributes=3,
+                                               kind="mlp", hidden=6, epochs=150)
+    assert model.kind == "mlp" and model.net is not None
+    linear_val, mlp_val = model.validation_rms[-2], model.validation_rms[-1]
+    if mlp_val > linear_val:
+        assert any("memorising" in n for n in model.notes), model.notes
+
+
+def test_network_fits_a_curve_a_line_cannot():
+    """The MLP has to earn its place: a quadratic a linear model must miss."""
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-2.0, 2.0, (600, 1))
+    y = (x[:, 0] ** 2) + rng.normal(0.0, 0.05, 600)
+    net = multiattribute.MLP(hidden=8, seed=0).fit(x, y, epochs=600)
+    net_rms = float(np.sqrt(np.mean((net.predict(x) - y) ** 2)))
+    design = np.hstack([x, np.ones_like(x)])
+    lin = design @ np.linalg.lstsq(design, y, rcond=None)[0]
+    lin_rms = float(np.sqrt(np.mean((lin - y) ** 2)))
+    assert net_rms < 0.5 * lin_rms, (net_rms, lin_rms)
+
+
+def test_index_curves_are_not_offered_as_prediction_targets():
+    """DEPT and the assigned time curve must never reach the target list.
+
+    Both are reproduced almost exactly by the time attribute, so a fit against
+    one scores beautifully and means nothing.  The synthetic wells carry DEPT
+    and TWT, which is why the check is worth having.
+    """
+    _volume, wells = _attribute_dataset()
+    offered = rockphysics.predictable_curves(wells)
+    assert "DEPT" not in offered, offered
+    assert "TWT" not in offered, offered
+    assert "PHIT" in offered and "RHOB" in offered, offered
+
+    # The time channel is excluded by assignment, not only by its name.
+    odd = wells[0]
+    odd.curves["XT"] = np.asarray(odd.twt, dtype=float)
+    odd.selection.time = "XT"
+    assert "XT" not in rockphysics.predictable_curves(wells)
+
+
+def test_attribute_figures_render():
+    volume, wells = _attribute_dataset()
+    attrs = multiattribute.compute_attributes(volume)
+    gate = (200.0, 600.0)
+    train = multiattribute.gather_training(volume, wells, "PHIT", attrs, gate=gate)
+    model = multiattribute.fit_multi_attribute(train, operator_half=1, max_attributes=3)
+
+    curve = viz.attribute_error_figure(multiattribute.validation_curve(model))
+    assert len(curve.data) == 2
+    assert curve.layout.yaxis.range[0] == 0
+
+    name = model.wells[0]
+    pred = model.predict_traces(train.per_well[name])
+    panel = viz.attribute_prediction_figure(pred, train.targets[name], volume.twt,
+                                            name, model.target, mask=train.masks[name])
+    assert len(panel.data) == 2
+    # The view is cropped to the trained interval, not the whole trace.
+    lo, hi = sorted(panel.layout.yaxis.range)
+    trained = volume.twt[train.masks[name]]
+    assert lo <= float(trained.min()) and hi >= float(trained.max())
+    assert hi - lo < 1.2 * (gate[1] - gate[0]), (lo, hi)
 
 
 
