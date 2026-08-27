@@ -115,6 +115,34 @@ cutoff the background carries no information, so the 10–60 Hz column is what t
 inversion actually recovered from the seismic. The seismic residual is blind
 everywhere: it is measured over all 601 traces without reference to the well.
 
+### A second dataset that did *not* work
+
+`scripts/validate_f3.py` was written to be a second inversion test, pairing F3
+well F02-1 with the inline 362 exported in `seg/tutorials-2017`. It is kept
+because the attempt is instructive, but **it produces no inversion scores**: the
+well cannot be located on that line.
+
+The test that settles it costs nothing. A well genuinely on a line ties best at
+the same crossline whichever gate you score over. Here the best crossline
+wanders over 14.2 km as the gate moves, and the correlation flips sign — the
+signature of no tie at all. The tutorial's own marker at crossline 336 is
+commented *"Just to display the well position"*: schematic, not a projection.
+
+Had that check been skipped, the run would have reported a full set of
+plausible-looking numbers — every method scoring *below* the background model,
+sparse-spike diverging to a 130% residual — and they would have meant nothing.
+A poor score and an absent tie look identical in the results table.
+
+What the F3 data does validate is the unit chain, on the opposite branch from
+Penobscot: F02-1 records DT in µs/m, RHOB in kg/m³ and depth in metres, against
+L-30's µs/ft, g/cm³ and feet. Its LAS also carries an AI curve computed by the
+publisher, so the impedance this app derives is checked against a third party's
+arithmetic rather than its own — **median disagreement 0.00%**. The folder
+scanner and checkshot reader are exercised on the real F3 layout at the same
+time.
+
+---
+
 The method ranking matches the synthetic study — Bayesian best, then
 model-based — and every engine now beats the background it was regularised
 toward.
