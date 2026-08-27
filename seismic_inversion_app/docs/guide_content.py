@@ -30,6 +30,14 @@ TERMS = {
     "drift (time-depth)": "расхождение",
     "drift (frequency)": "смещение",
     "datum": "уровень приведения",
+    # Proposed with this release, not yet reviewed term by term with the owner.
+    "seismic attribute": "сейсмический атрибут",
+    "multi-attribute prediction": "многоатрибутный прогноз",
+    "training error": "ошибка на обучающих данных",
+    "validation error": "ошибка на валидационной скважине",   # follows «blind well»
+    "overfitting": "переобучение",
+    "neural network": "нейронная сеть",
+    "operator length": "длина оператора",
 }
 
 TITLE_EN = "Post-Stack Seismic Inversion"
@@ -56,14 +64,18 @@ OVERVIEW = [
     ("p",
      "Four inversion engines are included, plus the QC needed to trust the result: "
      "well-tie optimisation, wavelet estimation, a low-frequency model, blind-well "
-     "cross-validation, and uncertainty. The workflow is eleven steps and is meant to "
-     "be followed in order — each step consumes what the previous one produced.",
+     "cross-validation, and uncertainty. Impedance can then be turned into a curve a "
+     "well measures — through a calibrated transform, or by predicting it directly "
+     "from seismic attributes. The workflow is eleven steps and is meant to be "
+     "followed in order — each step consumes what the previous one produced.",
      "Реализованы четыре алгоритма инверсии и весь контроль качества, необходимый, "
      "чтобы результату можно было доверять: оптимизация привязки скважин, оценка "
      "сейсмического импульса, низкочастотная модель, кросс-валидация на "
-     "неиспользованных данных и оценка неопределённости. Рабочий процесс состоит из "
-     "одиннадцати шагов и выполняется по порядку: каждый шаг использует результат "
-     "предыдущего."),
+     "неиспользованных данных и оценка неопределённости. Затем импеданс можно "
+     "преобразовать в кривую, измеряемую в скважине, — через калиброванную "
+     "зависимость либо прогнозируя её напрямую по сейсмическим атрибутам. Рабочий "
+     "процесс состоит из одиннадцати шагов и выполняется по порядку: каждый шаг "
+     "использует результат предыдущего."),
 
     ("h2", "What you need before you start", "Что нужно подготовить заранее"),
     ("bullets",
@@ -413,33 +425,55 @@ STEPS = [
     dict(
         n=10,
         en_title="Rock property", ru_title="Свойства породы",
-        en_does="Fits a transform from log-impedance to a well curve (porosity, for "
-                "example), applies it to the cube, and combines the inversion uncertainty "
-                "with the scatter of the wells about the fit.",
-        ru_does="Подбор зависимости между логарифмом импеданса и кривой ГИС (например, "
-                "пористостью), применение её к кубу и объединение неопределённости инверсии "
-                "с разбросом скважинных точек относительно подобранной зависимости.",
-        en_do="Choose the curve and the polynomial degree, fit, then predict the cube. Set a "
-              "cut-off to get a probability map and an expected net thickness.",
-        ru_do="Выберите кривую и степень полинома, выполните подбор, затем рассчитайте куб. "
-              "Задайте предел, чтобы получить карту вероятности и ожидаемую эффективную "
-              "толщину.",
-        en_check="R² of the fit. Below about 0.3, impedance explains little of that curve and "
-                 "the predicted cube will be closer to a constant than to a measurement. "
-                 "Check the crossplot for one cloud per well — that means the relation is "
-                 "well-specific and should not be applied across the survey.",
-        ru_check="Коэффициент детерминации R². Ниже ~0,3 импеданс почти не объясняет эту "
-                 "кривую, и расчётный куб будет ближе к константе, чем к измерению. На "
-                 "графике проверьте, не образует ли каждая скважина отдельное облако "
-                 "точек: это означает, что зависимость индивидуальна для скважины и не "
-                 "должна распространяться на всю площадь.",
+        en_does="Turns the result into a curve a well actually measures, by one of two "
+                "routes: a transform fitted from log-impedance to a well curve, or "
+                "multi-attribute prediction, which goes straight from seismic attributes to "
+                "the log and chooses its attributes by the error at a well it has not seen. "
+                "Either way the uncertainty is carried through to a cut-off.",
+        ru_does="Преобразует результат в кривую, которую действительно измеряют в скважине, "
+                "одним из двух путей: через зависимость между логарифмом импеданса и кривой "
+                "ГИС либо через многоатрибутный прогноз, который идёт от сейсмических "
+                "атрибутов к кривой напрямую и отбирает атрибуты по ошибке на скважине, "
+                "которую он не видел. В обоих случаях неопределённость доводится до предела "
+                "по свойству.",
+        en_do="Pick the route at the top of the page. Transform: choose the curve and the "
+              "polynomial degree, fit, predict the cube. Multi-attribute: choose the curve, "
+              "the operator length and the attribute limit, fit the predictor, then predict "
+              "the cube. Set a cut-off to get a probability map and an expected net thickness.",
+        ru_do="Выберите путь в верхней части страницы. Зависимость: выберите кривую и степень "
+              "полинома, выполните подбор, рассчитайте куб. Многоатрибутный прогноз: выберите "
+              "кривую, длину оператора и предельное число атрибутов, настройте прогноз, затем "
+              "рассчитайте куб. Задайте предел, чтобы получить карту вероятности и ожидаемую "
+              "эффективную толщину.",
+        en_check="For the transform: R² of the fit. Below about 0.3, impedance explains little "
+                 "of that curve and the predicted cube will be closer to a constant than to a "
+                 "measurement; check the crossplot for one cloud per well, which means the "
+                 "relation is well-specific. For multi-attribute: the validation error against "
+                 "the spread of the curve — at or above 1.0 the model is no better than "
+                 "predicting the mean.",
+        ru_check="Для зависимости — коэффициент детерминации R². Ниже ~0,3 импеданс почти не "
+                 "объясняет кривую, и расчётный куб будет ближе к константе, чем к измерению; "
+                 "на графике проверьте, не образует ли каждая скважина отдельное облако точек "
+                 "— это означает, что зависимость индивидуальна для скважины. Для "
+                 "многоатрибутного прогноза — отношение ошибки на валидационной скважине к "
+                 "разбросу кривой: при значении 1,0 и выше модель не лучше предсказания "
+                 "среднего.",
         fig="s10_page.png",
-        fig_en="Step 10 before a transform is fitted. Because impedance is an intermediate "
-               "quantity, this is where the workflow turns it into something a decision "
-               "can be made on.",
-        fig_ru="Шаг 10 до подбора зависимости. Импеданс — промежуточная величина, и именно "
-               "здесь он превращается в характеристику, на основе которой можно принимать "
-               "решение.",
+        fig_en="Step 10 with no inversion in the session. The transform route states what it "
+               "needs and refuses to guess; the multi-attribute route is available from the "
+               "start, because it predicts from the seismic itself rather than from impedance.",
+        fig_ru="Шаг 10, когда инверсия ещё не выполнена. Путь через зависимость сообщает, чего "
+               "ему не хватает, и не строит догадок; многоатрибутный путь доступен сразу, так "
+               "как он прогнозирует по самим сейсмическим данным, а не по импедансу.",
+        fig2="s10_multi_fit.png",
+        fig2_en="The multi-attribute route after a fit. The summary reports the training and "
+                "validation errors side by side, and the metric on the right divides the "
+                "validation error by the spread of the curve itself — the single number that "
+                "says whether the seismic is carrying this property at all.",
+        fig2_ru="Многоатрибутный путь после настройки. В сводке рядом приведены ошибки на "
+                "обучающих данных и на валидационной скважине, а показатель справа делит "
+                "вторую на разброс самой кривой — это единственное число, отвечающее на "
+                "вопрос, несут ли сейсмические данные информацию об этом свойстве.",
     ),
     dict(
         n=11,
@@ -507,8 +541,137 @@ METHOD_TABLE = {
     ],
 }
 
+MULTIATTRIBUTE = [
+    ("h1", "Predicting a log from the seismic",
+     "Прогноз кривой ГИС по сейсмическим данным"),
+    ("p",
+     "The transform on step 10 goes through impedance, so it can only carry what the "
+     "inversion resolved. The second route on that page goes straight from the seismic to "
+     "the log: the classical multi-attribute method (Hampson, Schultz &amp; Fehler, 2001). "
+     "It can find relations impedance alone misses — and it can just as easily fit noise, "
+     "which is why the whole method is built around one safeguard.",
+     "Зависимость на шаге 10 проходит через импеданс и поэтому несёт только то, что "
+     "восстановила инверсия. Второй путь на этой странице ведёт от сейсмических данных к "
+     "кривой ГИС напрямую — это классический многоатрибутный метод (Hampson, Schultz &amp; "
+     "Fehler, 2001). Он способен уловить связи, недоступные одному импедансу, и с той же "
+     "лёгкостью подстроиться под шум, поэтому весь метод построен вокруг одной защитной "
+     "меры."),
+    ("p",
+     "Thirteen attributes are derived from the volume — amplitude, envelope, instantaneous "
+     "phase and frequency, amplitude-weighted frequency, the integrated trace, the first and "
+     "second derivatives, four band-passed copies and time itself — and, when a full-volume "
+     "inversion exists, its impedance joins them. Each is read through a short "
+     "<b>operator</b> spanning several samples rather than at a single sample: a log responds "
+     "to a bed, a seismic sample responds to everything within a wavelet of it, and the two "
+     "only line up over a window.",
+     "Из куба рассчитываются тринадцать атрибутов: амплитуда, огибающая, мгновенная фаза и "
+     "мгновенная частота, частота, взвешенная по амплитуде, интегрированная трасса, первая и "
+     "вторая производные, четыре полосовые копии и само время; при наличии инверсии по всему "
+     "кубу к ним добавляется её импеданс. Каждый атрибут берётся не в одной точке, а через "
+     "короткий <b>оператор</b> длиной в несколько отсчётов: кривая ГИС отражает пласт, "
+     "отсчёт сейсмической трассы — всё, что попадает в пределы импульса, и совместить их "
+     "можно только на окне."),
+
+    ("h2", "How the number of attributes is chosen", "Как выбирается число атрибутов"),
+    ("numbered",
+     ["Attributes are added one at a time. At each step every remaining attribute is tried, "
+      "and the one that lowers the error most is kept.",
+      "The error that decides is measured on a well the model has <b>not</b> seen: each well "
+      "is held out in turn, the model is refitted without it, and scored against its log.",
+      "Selection stops when that error stops improving — whatever the training error is "
+      "doing."],
+     ["Атрибуты добавляются по одному. На каждом шаге перебираются все оставшиеся атрибуты, "
+      "и выбирается тот, который сильнее всего снижает ошибку.",
+      "Решающая ошибка измеряется на скважине, которую модель <b>не видела</b>: каждая "
+      "скважина по очереди исключается, модель настраивается заново без неё и сравнивается с "
+      "её кривой.",
+      "Отбор прекращается, когда эта ошибка перестаёт уменьшаться, — независимо от того, что "
+      "происходит с ошибкой на обучающих данных."]),
+    ("note",
+     "Training error can only fall as attributes are added. It is not evidence of anything. "
+     "A method that chose its size by training error would fit noise until it ran out of "
+     "attributes — which is how multi-attribute prediction earned its reputation for "
+     "producing beautiful maps of nothing.",
+     "Ошибка на обучающих данных может только уменьшаться по мере добавления атрибутов и "
+     "поэтому ничего не доказывает. Метод, выбирающий размер модели по ней, подстраивался бы "
+     "под шум, пока не закончатся атрибуты, — именно так многоатрибутный прогноз заработал "
+     "репутацию источника красивых карт, за которыми ничего нет."),
+    ("figure", "s10_multi_error.png",
+     "The panel that decides. Training error (blue) can only fall; validation error (red), "
+     "measured on a well the fit never saw, is the one that matters, and the dotted line "
+     "marks where selection stopped. The dashed line across the top is the error you would "
+     "get by predicting the mean everywhere: a validation curve that never drops clearly "
+     "below it means the seismic is not carrying this property, however good the training "
+     "fit looks.",
+     "Решающая панель. Ошибка на обучающих данных (синяя) может только убывать; значение "
+     "имеет ошибка на валидационной скважине (красная), измеренная на данных, которых модель "
+     "не видела, а пунктирная вертикаль отмечает момент остановки отбора. Горизонтальная "
+     "штриховая линия — ошибка, которую дало бы простое предсказание среднего: если красная "
+     "кривая не опускается заметно ниже неё, сейсмические данные не несут информации об этом "
+     "свойстве, каким бы хорошим ни выглядело обучение.",
+     1.0, 88),
+
+    ("h2", "What the app says out loud", "О чём программа предупреждает прямо"),
+    ("bullets",
+     ["<b>Validation error no better than predicting the mean</b> — the model has learned "
+      "nothing that generalises to a well it has not seen.",
+      "<b>Validation error still falling at the attribute limit</b> — the limit chose the "
+      "size of the model, not the data. Raise it and refit.",
+      "<b>Validation error far above training error</b> — the extra freedom is being spent "
+      "on memorising the wells.",
+      "<b>Fewer than two wells</b> — the fit is refused outright: with one well there is "
+      "nothing to validate against.",
+      "<b>A neural network that validates worse than the linear model</b> — said plainly, "
+      "rather than presenting the more elaborate answer as the better one."],
+     ["<b>Ошибка на валидационной скважине не лучше предсказания среднего</b> — модель не "
+      "выявила ничего, что переносится на скважину, которую она не видела.",
+      "<b>Ошибка продолжала убывать на пределе числа атрибутов</b> — размер модели определён "
+      "этим пределом, а не данными. Увеличьте предел и повторите настройку.",
+      "<b>Ошибка на валидационной скважине намного больше ошибки на обучающих данных</b> — "
+      "избыточная свобода тратится на запоминание скважин.",
+      "<b>Менее двух скважин</b> — настройка отклоняется: по одной скважине проверять не на "
+      "чем.",
+      "<b>Нейронная сеть проверяется хуже линейной модели</b> — об этом сообщается прямо, а "
+      "не подаётся как более совершенный результат."]),
+    ("p",
+     "The <b>neural network</b> option is one hidden layer, fitted on the attributes the "
+     "linear selection already chose, so the two are compared on equal footing. The "
+     "uncertainty carried into the cut-off is the validation error itself, held constant over "
+     "the cube: there is no posterior on this route, and what the predictor missed at a well "
+     "it had never seen is the only error bar it has earned.",
+     "Вариант с <b>нейронной сетью</b> — один скрытый слой, настраиваемый на тех же "
+     "атрибутах, которые отобрала линейная модель, чтобы сравнение было равным. В расчёт "
+     "предела передаётся сама ошибка на валидационной скважине, постоянная по всему кубу: "
+     "апостериорного распределения на этом пути нет, и то, что прогноз не угадал на скважине, "
+     "которую не видел, — единственная обоснованная оценка его погрешности."),
+    ("figure", "s10_multi_well.png",
+     "The predicted curve against the measured log at one well, on the demo dataset. The "
+     "final model is fitted on every well, so this panel shows the fit rather than a blind "
+     "test — the blind number is the validation error above. What it does show honestly is "
+     "the resolution on offer: the prediction follows the log where the seismic has "
+     "something to say and smooths through the thin beds it cannot resolve.",
+     "Прогнозная кривая и измеренный каротаж в одной скважине на демонстрационном наборе. "
+     "Итоговая модель настроена по всем скважинам, поэтому панель показывает качество "
+     "настройки, а не независимую проверку — независимая оценка приведена выше. Зато она "
+     "честно показывает достижимую разрешающую способность: прогноз следует за каротажем "
+     "там, где сейсмика несёт информацию, и сглаживает тонкие пласты, которые она не "
+     "разрешает.",
+     0.82, 96),
+    ("note",
+     "<b>Which route?</b> The transform is the safer default: one relation, one set of "
+     "coefficients, and its failure is visible as a low R². Multi-attribute prediction is "
+     "worth reaching for when impedance demonstrably does not explain the curve, and when "
+     "there are enough wells that holding one out still leaves a model worth fitting. Two "
+     "wells make validation possible; five or more make it meaningful.",
+     "<b>Какой путь выбрать?</b> Зависимость через импеданс безопаснее как выбор по "
+     "умолчанию: одно соотношение, один набор коэффициентов, а его несостоятельность видна по "
+     "низкому R². Многоатрибутный прогноз оправдан, когда импеданс явно не объясняет кривую и "
+     "когда скважин достаточно, чтобы после исключения одной модель оставалась осмысленной. "
+     "Две скважины делают проверку возможной, пять и более — содержательной."),
+]
+
 PITFALLS = [
-    ("h1", "Five things that go wrong", "Пять типичных ошибок"),
+    ("h1", "Six things that go wrong", "Шесть типичных ошибок"),
     ("numbered",
      [("<b>Units.</b> A sonic read as µs/m when it is really µs/ft scales velocity by 3.28. "
        "A density read as g/cm³ when it is kg/m³ is out by 1,000. A depth index in feet "
@@ -528,7 +691,12 @@ PITFALLS = [
       ("<b>Under-regularised sparse-spike.</b> Driving the residual to near zero means "
        "fitting noise. On real data an under-regularised run scored <i>below</i> the "
        "background model while fitting the seismic to 0.5%. Choose the weight from the "
-       "noise level.")],
+       "noise level."),
+      ("<b>A training fit is not a result.</b> On the multi-attribute route, adding "
+       "attributes always improves the fit at the wells the model was given. Only the error "
+       "at a well held out of the fit says whether anything was learned — and it means "
+       "nothing until it is compared with the spread of the curve itself. An error equal to "
+       "the spread is a model no better than predicting the mean.")],
      [("<b>Единицы измерения.</b> Акустический каротаж, прочитанный как мкс/м вместо "
        "мкс/фут, завышает скорость в 3,28 раза. Плотность, прочитанная как г/см³ вместо "
        "кг/м³, ошибочна в 1 000 раз. Глубина в футах, принятая за метры, смещает всю "
@@ -550,7 +718,12 @@ PITFALLS = [
       ("<b>Недорегуляризованная разреженно-импульсная инверсия.</b> Сведение невязки почти "
        "к нулю означает подстройку под шум. На реальных данных такой расчёт дал результат "
        "<i>хуже</i> низкочастотной модели при невязке 0,5 %. Подбирайте вес по уровню "
-       "шума.")]),
+       "шума."),
+      ("<b>Совпадение на обучающих данных — не результат.</b> На многоатрибутном пути "
+       "добавление атрибутов всегда улучшает совпадение на тех скважинах, которые были даны "
+       "модели. О том, выявлено ли что-либо, говорит только ошибка на исключённой скважине — "
+       "и она ничего не значит, пока не сопоставлена с разбросом самой кривой. Ошибка, "
+       "равная разбросу, означает модель не лучше предсказания среднего.")]),
 ]
 
 RESULTS = [
@@ -656,4 +829,22 @@ GLOSSARY = [
     ("Formation tops", "Отбивки",
      "Picked formation boundaries in a well.",
      "Отмеченные границы пластов в скважине."),
+    ("Seismic attribute", "Сейсмический атрибут",
+     "A quantity derived from the trace: envelope, phase, frequency and so on.",
+     "Величина, рассчитанная по трассе: огибающая, фаза, частота и подобные."),
+    ("Multi-attribute prediction", "Многоатрибутный прогноз",
+     "Predicting a well curve from several seismic attributes at once.",
+     "Прогноз кривой ГИС сразу по нескольким сейсмическим атрибутам."),
+    ("Training error", "Ошибка на обучающих данных",
+     "Error at the wells the model was fitted on. Always falls as the model grows.",
+     "Ошибка на скважинах, по которым настроена модель. Всегда убывает с ростом модели."),
+    ("Validation error", "Ошибка на валидационной скважине",
+     "Error at a well held out of the fit. The number that decides.",
+     "Ошибка на скважине, исключённой из настройки. Именно она является решающей."),
+    ("Overfitting", "Переобучение",
+     "Fitting the noise in the wells instead of the relation between them.",
+     "Подстройка под шум в скважинах вместо связи, общей для них."),
+    ("Operator length", "Длина оператора",
+     "How many samples of an attribute are used to predict one sample of the log.",
+     "Сколько отсчётов атрибута используется для прогноза одного отсчёта кривой."),
 ]

@@ -1228,20 +1228,27 @@ def attribute_error_figure(curve: dict, height: int = 460) -> go.Figure:
 
 
 def attribute_prediction_figure(predicted: np.ndarray, target: np.ndarray, twt: np.ndarray,
-                                name: str, label: str, mask=None, height: int = 560) -> go.Figure:
+                                name: str, label: str, mask=None, trim: int = 0,
+                                height: int = 560) -> go.Figure:
     """A predicted curve against the measured log at one well.
 
-    The view is cropped to the interval the model was trained over.  Outside it
-    the prediction is still computed -- the operator simply pads at the ends of
-    the trace -- and those padded tails run to values the log never takes, which
-    would squash the part worth looking at into a narrow band.
+    The view is cropped to the interval the model was trained over, and ``trim``
+    (half the operator length) drops the samples at each end of the trace where
+    the operator has no real input and pads instead.  Both matter: those padded
+    samples run to values the log never takes, and left in they would squash the
+    part worth looking at into a narrow band at the centre of the axis.
     """
     fig = go.Figure()
     good = np.isfinite(target)
     shown = good if mask is None else (good & np.asarray(mask, dtype=bool))
-    fig.add_trace(go.Scatter(x=target[good], y=twt[good], mode="lines", name="measured",
-                             line=dict(color="#111111", width=2.0)))
-    fig.add_trace(go.Scatter(x=predicted, y=twt, mode="lines", name="predicted",
+    if trim > 0 and shown.size > 2 * trim:
+        edge = np.zeros_like(shown)
+        edge[trim:shown.size - trim] = True
+        shown &= edge
+    drawn = np.where(shown, np.asarray(predicted, dtype=float), np.nan)
+    fig.add_trace(go.Scatter(x=np.where(shown, target, np.nan), y=twt, mode="lines",
+                             name="measured", line=dict(color="#111111", width=2.0)))
+    fig.add_trace(go.Scatter(x=drawn, y=twt, mode="lines", name="predicted",
                              line=dict(color="#c0504d", width=1.8)))
     yaxis = dict(autorange="reversed")
     xaxis = {}

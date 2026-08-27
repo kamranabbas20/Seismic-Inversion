@@ -569,6 +569,10 @@ def build(out_path):
         "Остальные три метода сшиваются с низкочастотной моделью и дают абсолютные "
         "значения, поэтому сначала нужно построить эту модель (шаг 7)."))
 
+    # ---- multi-attribute prediction --------------------------------------
+    story.append(PageBreak())
+    render_blocks(C.MULTIATTRIBUTE, story)
+
     # ---- pitfalls --------------------------------------------------------
     story.append(PageBreak())
     render_blocks(C.PITFALLS, story)

@@ -32,3 +32,10 @@ Borehole path	Траектория ствола / по стволу скважи
 Q factor / absorption	Поглощение	one term for both
 Coloured/Sparse-spike/Model-based/Bayesian	Цветная / Разреженно-импульсная / На основе модели / Байесовская	confirmed as-is
 Routine batch (~40 terms)	confirmed as proposed	see guide_content.py
+Seismic attribute	Сейсмический атрибут	PROPOSED - not yet reviewed
+Multi-attribute prediction	Многоатрибутный прогноз	PROPOSED - not yet reviewed
+Attribute operator (length)	Оператор атрибута (длина)	PROPOSED - not yet reviewed
+Training error	Ошибка на обучающих данных	PROPOSED - not yet reviewed
+Validation error	Ошибка на валидационной скважине	PROPOSED - follows the confirmed «валидационная скважина»
+Overfitting	Переобучение	PROPOSED - not yet reviewed
+Neural network	Нейронная сеть	PROPOSED - not yet reviewed

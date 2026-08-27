@@ -2230,7 +2230,13 @@ def _page_property_multiattribute(vol, wells, ties) -> None:
         return
 
     result = st.session_state.result
-    have_ai = result is not None and result.absolute_ai is not None
+    # A preview run covers part of the volume, so its impedance cannot be lined up
+    # with attributes computed over the whole cube.  Offering it would only produce
+    # a shape error at fit time.
+    have_ai = (result is not None and result.absolute_ai is not None
+               and not result.is_subset
+               and np.shape(result.absolute_ai) == np.shape(vol.data))
+    subset_ai = (result is not None and result.absolute_ai is not None and not have_ai)
     gate = get_gate()
 
     c1, c2, c3 = st.columns(3)
@@ -2257,6 +2263,10 @@ def _page_property_multiattribute(vol, wells, ties) -> None:
                          disabled=not have_ai, key="ma_use_ai",
                          help="Inversion output makes a strong attribute: it already carries the "
                               "low frequencies the seismic does not." if have_ai else
+                              "This result covers only part of the volume, so it cannot be lined "
+                              "up with attributes over the whole cube. Run the full volume on "
+                              + step_ref("inversion") + " to use its impedance here."
+                              if subset_ai else
                               "Run an inversion first to offer its impedance as an attribute.")
 
     if st.button("Fit predictor", type="primary"):
@@ -2317,7 +2327,7 @@ def _page_property_multiattribute(vol, wells, ties) -> None:
                 pred = model.predict_traces(train.per_well[name])
                 st.plotly_chart(viz.attribute_prediction_figure(
                     pred, train.targets[name], vol.twt, name, model.target,
-                    mask=train.masks.get(name)), width="stretch")
+                    mask=train.masks.get(name), trim=model.operator_half), width="stretch")
 
     st.divider()
     st.subheader("Apply to the cube")

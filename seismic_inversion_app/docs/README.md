@@ -17,9 +17,13 @@ the text can be revised without touching the PDF machinery.
 
 `shots/` holds the figures the guide embeds: one per workflow step, captured by
 driving the running app with Playwright, plus `penobscot.png` from
-`scripts/validate_penobscot.py`. A missing image is a skipped figure and a note,
-not a build failure, so the guide still builds on a machine that has never run
-the app.
+`scripts/validate_penobscot.py`. Streamlit's main column is as tall as the
+viewport whatever it contains, so a short page captures with a field of white
+under it; trim those rows before embedding, or the PDF scales the blank space
+along with the content and the figure lands a third of its useful size.
+
+A missing image is a skipped figure and a note, not a build failure, so the
+guide still builds on a machine that has never run the app.
 
 To refresh them, start the app and re-run the capture against it. Two things
 that cost time when this was first written: Streamlit's `networkidle` fires
@@ -31,8 +35,12 @@ by counting how many appear after an action.
 ## Terminology
 
 `terminology_ru.tsv` records the Russian term agreed for each English one,
-reviewed term by term with the project owner. Several are deliberate departures
-from the literal translation — *post-stack* is «суммарные данные» not
+reviewed term by term with the project owner. Rows marked PROPOSED are the
+exception: the multi-attribute vocabulary was written with this release and has
+not been through that review yet.
+
+Several of the settled terms are deliberate departures from the literal
+translation — *post-stack* is «суммарные данные» not
 «постстековые», *well tie* is «привязка» not «увязка», and English's
 tops/markers and misfit/residual pairs each collapse to one Russian word. The
 low-frequency model is never abbreviated. Check that file before changing any
