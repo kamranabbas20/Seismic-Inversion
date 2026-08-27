@@ -173,9 +173,12 @@ def render_blocks(blocks, story):
             story.append(result_table())
             story.append(Spacer(1, 6))
         elif kind == "figure":
+            # block[5] is a height cap in *millimetres*, matching how the step
+            # figures declare theirs -- passing raw points here silently
+            # shrank a full-width figure to a third of its size.
             fig = figure(block[1], block[2], block[3],
                          max_w=block[4] if len(block) > 4 else 1.0,
-                         max_h=block[5] if len(block) > 5 else 118 * mm)
+                         max_h=(block[5] if len(block) > 5 else 118) * mm)
             if fig is not None:
                 story.append(fig)
 
@@ -276,7 +279,27 @@ def step_card(step):
         ("LINEBELOW", (0, 0), (-1, -2), 0.4, RULE),
         ("BOX", (0, 0), (-1, -1), 0.6, RULE),
     ]))
-    return KeepTogether([head, body, Spacer(1, 5)])
+    card = KeepTogether([head, body, Spacer(1, 5)])
+
+    # Figures follow the card rather than living inside it: a step card plus a
+    # tall screenshot rarely fits one page, and KeepTogether would then push the
+    # whole thing over, leaving half a page empty.
+    out = [card]
+    # Captions are prefixed with the step, because a figure regularly lands on
+    # the page after its card -- a reader opening at that page would otherwise
+    # meet a picture with nothing saying which step it belongs to.
+    tag_en = f'<font color="#2d5f8a"><b>Step {step["n"]} — {step["en_title"]}.</b></font> '
+    tag_ru = f'<font color="#2d5f8a"><b>Шаг {step["n"]} — {step["ru_title"]}.</b></font> '
+    for key, cap_en, cap_ru in (("fig", "fig_en", "fig_ru"),
+                                ("fig2", "fig2_en", "fig2_ru")):
+        name = step.get(key)
+        if not name:
+            continue
+        fig = figure(name, tag_en + step.get(cap_en, ""), tag_ru + step.get(cap_ru, ""),
+                     max_h=step.get(key + "_h", 92) * mm)
+        if fig is not None:
+            out.append(fig)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -307,7 +330,7 @@ def method_table():
 
 
 RESULT_ROWS = [
-    ("Low-frequency model only\nТолько НЧ-модель", "0.319", "0.333", False),
+    ("Low-frequency model only\nТолько низкочастотная модель", "0.319", "0.333", False),
     ("Coloured / Цветная", "0.337", "0.490", False),
     ("Sparse-spike / Разреженно-импульсная", "0.293", "0.374", False),
     ("Model-based / На основе модели", "0.384", "0.494", False),
@@ -369,12 +392,12 @@ def workflow_map():
                                             (2, "Seismic viewer / Просмотр"),
                                             (3, "Log QC / КК каротажа"),
                                             (4, "Correlation / Корреляция")]),
-        ("CALIBRATE / КАЛИБРОВКА", colors.HexColor("#4a7c59"), [(5, "Well tie / Увязка"),
+        ("CALIBRATE / КАЛИБРОВКА", colors.HexColor("#4a7c59"), [(5, "Well tie / Привязка"),
                                                                 (6, "Wavelet / Импульс"),
-                                                                (7, "LFM / НЧ-модель")]),
+                                                                (7, "Низкочастотная модель")]),
         ("INVERT / ИНВЕРСИЯ", ACCENT, [(8, "Inversion / Инверсия")]),
         ("VERIFY & USE / ПРОВЕРКА", colors.HexColor("#6b5b95"),
-         [(9, "Blind validation / Слепая проверка"),
+         [(9, "Validation / Валидация"),
           (10, "Rock property / Свойства породы"),
           (11, "Results / Результаты")]),
     ]
@@ -459,7 +482,7 @@ def content_page(canvas, doc):
     canvas.drawString(MARGIN, PAGE_H - MARGIN + 6.6 * mm,
                       "Post-Stack Seismic Inversion — user guide")
     canvas.drawRightString(PAGE_W - MARGIN, PAGE_H - MARGIN + 6.6 * mm,
-                           "Постстековая сейсмическая инверсия — руководство")
+                           "Инверсия суммарных сейсмических данных — руководство")
     canvas.line(MARGIN, MARGIN - 4 * mm, PAGE_W - MARGIN, MARGIN - 4 * mm)
     canvas.setFillColor(MUTED)
     canvas.drawCentredString(PAGE_W / 2, MARGIN - 8.5 * mm, str(canvas.getPageNumber()))
@@ -520,7 +543,7 @@ def build(out_path):
     story.append(Paragraph("Одиннадцать шагов", S["h1ru"]))
     story.append(rule())
     for step in C.STEPS:
-        story.append(step_card(step))
+        story.extend(step_card(step))
 
     # ---- methods ---------------------------------------------------------
     story.append(PageBreak())

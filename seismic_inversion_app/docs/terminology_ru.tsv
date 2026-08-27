@@ -1,0 +1,34 @@
+English	Russian (confirmed)	notes
+Post-stack (data)	Суммарные данные	title becomes "Инверсия суммарных сейсмических данных"
+Wavelet	Сейсмический импульс	drop «вейвлет» entirely
+Well tie	Привязка	привязать скважину; корреляция привязки
+Log QC / QC	Контроль качества ГИС / контроль качества	confirmed as-is
+Low-frequency model	Низкочастотная модель	NO abbreviation; also replaces "background model"
+Blind well	Валидационная скважина	
+Blind validation (step 9)	Валидация на неиспользованных данных	"not blind" reworded off this
+Uplift	Улучшение	table column heading
+Coloured inversion	Цветная инверсия	confirmed as-is
+Sparse-spike inversion	Разреженно-импульсная инверсия	confirmed as-is
+Model-based inversion	Инверсия на основе модели	confirmed as-is
+Bayesian inversion	Байесовская инверсия	confirmed as-is
+Checkshot	Данные ВСП	folder name stays Latin
+Analysis gate	Интервал анализа	confirmed as-is
+Cut-off	Предел	
+Net thickness	Эффективная толщина	confirmed as-is
+Drift (time-depth)	Расхождение	sense 1: sonic drift
+Drift (frequency)	Смещение	sense 2: wavelet with Q
+Inline	Продольный профиль	Latin in brackets on first use per section
+Crossline	Поперечный профиль	Latin in brackets on first use per section
+Formation top / marker	Отбивки	one term for both
+Crossplot	График	
+Polarity	Полярность	
+Mute	Мьютинг / зона мьютинга	
+Dead trace	«Мёртвая» трасса	
+Acquisition footprint	Следы системы наблюдений	
+Misfit / residual	Невязка	one word for both
+Prior / posterior	Априорный / апостериорный	std dev written out, not СКО
+Datum	Уровень приведения	
+Borehole path	Траектория ствола / по стволу скважины	
+Q factor / absorption	Поглощение	one term for both
+Coloured/Sparse-spike/Model-based/Bayesian	Цветная / Разреженно-импульсная / На основе модели / Байесовская	confirmed as-is
+Routine batch (~40 terms)	confirmed as proposed	see guide_content.py

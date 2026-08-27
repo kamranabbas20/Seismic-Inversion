@@ -13,6 +13,31 @@ python build_guide.py Seismic_Inversion_Guide_EN_RU.pdf
 The wording lives in `guide_content.py` and the layout in `build_guide.py`, so
 the text can be revised without touching the PDF machinery.
 
+## Screenshots
+
+`shots/` holds the figures the guide embeds: one per workflow step, captured by
+driving the running app with Playwright, plus `penobscot.png` from
+`scripts/validate_penobscot.py`. A missing image is a skipped figure and a note,
+not a build failure, so the guide still builds on a machine that has never run
+the app.
+
+To refresh them, start the app and re-run the capture against it. Two things
+that cost time when this was first written: Streamlit's `networkidle` fires
+while the page is still being drawn over the websocket, so wait for a button to
+have a real label rather than for a fixed timeout; and Streamlit dataframes
+render to canvas, so their `inner_text` is empty and they can only be told apart
+by counting how many appear after an action.
+
+## Terminology
+
+`terminology_ru.tsv` records the Russian term agreed for each English one,
+reviewed term by term with the project owner. Several are deliberate departures
+from the literal translation — *post-stack* is «суммарные данные» not
+«постстековые», *well tie* is «привязка» not «увязка», and English's
+tops/markers and misfit/residual pairs each collapse to one Russian word. The
+low-frequency model is never abbreviated. Check that file before changing any
+Russian wording, so a settled decision is not quietly reversed.
+
 DejaVu Sans is registered explicitly: ReportLab's built-in fonts carry no
 Cyrillic, and with Helvetica every Russian character renders as a black box.
 The font is expected at `/usr/share/fonts/truetype/dejavu`; on Windows or macOS
